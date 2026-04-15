@@ -12,8 +12,9 @@ OBJCOPY  = $(PREFIX)objcopy
 OBJDUMP  = $(PREFIX)objdump
 SIZE     = $(PREFIX)size
 
-OPENOCD  = openocd
-OCD_CFG  = /home/omar/WHC-MCU/tools/openocd/wch-riscv.cfg
+OPENOCD  ?= openocd
+# Relative path from a project dir (projects/<name>/) to tools/openocd/
+OCD_CFG  ?= $(COMMON)/../../../tools/openocd/wch-riscv.cfg
 
 ARCH     = -march=rv32imac_zicsr_zifencei -mabi=ilp32
 
