@@ -1,0 +1,102 @@
+# ============================================================
+# Makefile.common — Reglas compartidas para CH32V203 (WCH HAL)
+# Incluir desde cada proyecto con: include ../../common/Makefile.common
+# ============================================================
+
+COMMON   = ../../common
+SDK      = ../../sdk
+
+PREFIX   = riscv-none-elf-
+CC       = $(PREFIX)gcc
+OBJCOPY  = $(PREFIX)objcopy
+OBJDUMP  = $(PREFIX)objdump
+SIZE     = $(PREFIX)size
+
+OPENOCD  = openocd
+OCD_CFG  = /home/omar/WHC-MCU/tools/openocd/wch-riscv.cfg
+
+ARCH     = -march=rv32imac_zicsr_zifencei -mabi=ilp32
+
+INCLUDES = -I$(SDK)/Core \
+           -I$(SDK)/Debug \
+           -I$(SDK)/Peripheral/inc \
+           -I.
+
+CFLAGS  += $(ARCH) -Os -g -Wall \
+           -DCH32V20x_D6 \
+           -ffunction-sections -fdata-sections \
+           -nostartfiles \
+           $(INCLUDES)
+
+LDFLAGS += $(ARCH) -T $(SDK)/Ld/Link.ld \
+           -nostartfiles -Wl,--gc-sections \
+           -Wl,-Map=$(BUILD)/$(TARGET).map \
+           --specs=nano.specs --specs=nosys.specs
+
+SDK_SRCS_C = \
+    $(SDK)/Core/core_riscv.c \
+    $(SDK)/Core/system_ch32v20x.c \
+    $(SDK)/Core/ch32v20x_it.c \
+    $(SDK)/Debug/debug.c \
+    $(SDK)/Peripheral/src/ch32v20x_rcc.c \
+    $(SDK)/Peripheral/src/ch32v20x_gpio.c \
+    $(SDK)/Peripheral/src/ch32v20x_misc.c \
+    $(SDK)/Peripheral/src/ch32v20x_usart.c
+
+SDK_SRCS_S = $(SDK)/Startup/startup_ch32v20x_D6.S
+
+BUILD   ?= build
+
+C_OBJS   = $(addprefix $(BUILD)/, $(notdir $(SRCS_C:.c=.o)))
+SDK_C_OBJS = $(addprefix $(BUILD)/sdk_, $(notdir $(SDK_SRCS_C:.c=.o)))
+SDK_S_OBJS = $(addprefix $(BUILD)/sdk_, $(notdir $(SDK_SRCS_S:.S=.o)))
+
+OBJS = $(C_OBJS) $(SDK_C_OBJS) $(SDK_S_OBJS)
+
+.PHONY: all clean flash erase
+
+all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin
+	@$(SIZE) $(BUILD)/$(TARGET).elf
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/%.o: %.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+define SDK_C_RULE
+$(BUILD)/sdk_$(notdir $(1:.c=.o)): $(1) | $(BUILD)
+	$(CC) $(CFLAGS) -c $$< -o $$@
+endef
+$(foreach src,$(SDK_SRCS_C),$(eval $(call SDK_C_RULE,$(src))))
+
+define SDK_S_RULE
+$(BUILD)/sdk_$(notdir $(1:.S=.o)): $(1) | $(BUILD)
+	$(CC) $(CFLAGS) -c $$< -o $$@
+endef
+$(foreach src,$(SDK_SRCS_S),$(eval $(call SDK_S_RULE,$(src))))
+
+$(BUILD)/$(TARGET).elf: $(OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+	$(OBJDUMP) -d $@ > $(BUILD)/$(TARGET).lst
+
+$(BUILD)/$(TARGET).hex: $(BUILD)/$(TARGET).elf
+	$(OBJCOPY) -O ihex $< $@
+
+$(BUILD)/$(TARGET).bin: $(BUILD)/$(TARGET).elf
+	$(OBJCOPY) -O binary $< $@
+
+flash: $(BUILD)/$(TARGET).elf
+	$(OPENOCD) -f $(OCD_CFG) \
+	  -c "init" -c "halt" \
+	  -c "program $(BUILD)/$(TARGET).elf verify" \
+	  -c "reset" -c "exit"
+
+erase:
+	$(OPENOCD) -f $(OCD_CFG) \
+	  -c "init" -c "halt" \
+	  -c "flash erase_sector wch_riscv.flash 0 last" \
+	  -c "exit"
+
+clean:
+	rm -rf $(BUILD)

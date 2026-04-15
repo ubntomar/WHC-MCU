@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.lst
+*.map
+*.su
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.cache/
+compile_commands.json
+
+# Upstream SDK clones — reproducible via scripts/bootstrap_*.sh
+ch32v/ch32v203/_upstream/
+ch32v/*/sdk_upstream/
+
+# Secrets (por si acaso)
+.env
+.env.*
+*.pem
+*.key
+secrets/
+credentials*
+
+# Logs
+*.log
+openocd.log
