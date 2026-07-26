@@ -44,6 +44,10 @@ SDK_SRCS_C = \
     $(SDK)/Peripheral/src/ch32v20x_misc.c \
     $(SDK)/Peripheral/src/ch32v20x_usart.c
 
+# Módulos HAL extra por proyecto: definir SDK_EXTRA_C antes del include
+# (p.ej. SDK_EXTRA_C = $(SDK)/Peripheral/src/ch32v20x_adc.c)
+SDK_SRCS_C += $(SDK_EXTRA_C)
+
 SDK_SRCS_S = $(SDK)/Startup/startup_ch32v20x_D6.S
 
 BUILD   ?= build
