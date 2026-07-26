@@ -33,8 +33,8 @@ int main(void)
 
     while (1) {
         GPIO_SetBits(GPIOA, GPIO_Pin_1);
-        Delay_Ms(250);
+        Delay_Ms(100);
         GPIO_ResetBits(GPIOA, GPIO_Pin_1);
-        Delay_Ms(250);
+        Delay_Ms(100);
     }
 }
