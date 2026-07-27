@@ -23,6 +23,16 @@
  * El esclavo jamás transmite sin ser interrogado → bus sin colisiones
  * por diseño (el maestro sondea cada dirección).
  *
+ * AUTO-DESCUBRIMIENTO (FC usuario 0x41, siempre a broadcast addr 0):
+ *   sub 0x01 QUERY:  [00][41][01][nbits][prefijo 12B][crc]
+ *     Las tarjetas SIN CONFIGURAR (addr 247) cuyo UID empiece con ese
+ *     prefijo de nbits responden [F7][41][01][uid 12B][fw 2B][crc].
+ *     Varias a la vez → colisión (CRC roto en el maestro) → el maestro
+ *     parte la rama del árbol de bits y desciende hasta aislar cada una.
+ *   sub 0x02 ASSIGN: [00][41][02][uid 12B][addr][crc]
+ *     La tarjeta con UID exacto (configurada o no) adopta la dirección,
+ *     la persiste y responde [addr][41][02][uid 12B][crc].
+ *
  * Hardware: ADC PA0 (divisor 47K/10K), RS-485 USART3 PB10/PB11/PB12,
  * debug USART2 PA2/PA3, LED D4 PA1 (destello por transacción válida).
  */
@@ -31,7 +41,15 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION   0x0100
+#define FW_VERSION   0x0103
+#define FC_DISCOVERY 0x41
+
+/*
+ * LED D4 = indicador de estado/fase:
+ *   Sin configurar (addr 247): parpadeo rápido continuo 5 Hz
+ *   Configurada en espera:     latido corto (40 ms) cada 2 s
+ *   Transacción atendida:      flash de 40 ms (sondeo activo = ritmo)
+ */
 #define DE_PORT      GPIOB
 #define DE_PIN       GPIO_Pin_12
 
@@ -317,6 +335,69 @@ static uint8_t holding_write(uint16_t idx, uint16_t val)
     }
 }
 
+static int uid_prefix_match(uint8_t nbits, const uint8_t *prefix)
+{
+    const uint8_t *uid  = (const uint8_t *)UID_BASE;
+    uint8_t        full = nbits / 8, rem = nbits % 8;
+
+    if (nbits > 96)
+        return 0;
+    if (memcmp(uid, prefix, full))
+        return 0;
+    if (rem) {
+        uint8_t mask = (uint8_t)(0xFF << (8 - rem));
+        if ((uid[full] ^ prefix[full]) & mask)
+            return 0;
+    }
+    return 1;
+}
+
+/* devuelve 1 si esta tarjeta respondió (para el LED) */
+static int mb_discovery(const uint8_t *f, uint32_t len)
+{
+    const uint8_t *uid = (const uint8_t *)UID_BASE;
+    uint8_t        resp[20];
+    uint16_t       crc;
+
+    if (len != 18)
+        return 0;
+
+    if (f[2] == 0x01) {                   /* QUERY: solo sin configurar */
+        if (g_addr != DEFAULT_ADDR || !uid_prefix_match(f[3], &f[4]))
+            return 0;
+        resp[0] = DEFAULT_ADDR;
+        resp[1] = FC_DISCOVERY;
+        resp[2] = 0x01;
+        memcpy(&resp[3], uid, 12);
+        resp[15] = FW_VERSION >> 8;
+        resp[16] = FW_VERSION & 0xFF;
+        crc = crc16(resp, 17);
+        resp[17] = crc & 0xFF;
+        resp[18] = crc >> 8;
+        rs485_send(resp, 19);
+        return 1;
+
+    } else if (f[2] == 0x02) {            /* ASSIGN por UID exacto */
+        uint8_t na = f[15];
+
+        if (memcmp(&f[3], uid, 12) || na < 1 || na > 246)
+            return 0;
+        g_addr = na;
+        if (cfg_save())
+            return 0;                     /* falló flash: silencio */
+        resp[0] = na;
+        resp[1] = FC_DISCOVERY;
+        resp[2] = 0x02;
+        memcpy(&resp[3], uid, 12);
+        crc = crc16(resp, 15);
+        resp[15] = crc & 0xFF;
+        resp[16] = crc >> 8;
+        rs485_send(resp, 17);
+        return 1;
+    }
+    return 0;
+}
+
 static void mb_exception(uint8_t addr, uint8_t fc, uint8_t code)
 {
     uint8_t  r[5] = { addr, (uint8_t)(fc | 0x80), code };
@@ -327,17 +408,29 @@ static void mb_exception(uint8_t addr, uint8_t fc, uint8_t code)
     rs485_send(r, 5);
 }
 
-static void mb_handle(const uint8_t *f, uint32_t len)
+/* devuelve 1 si el frame era para esta tarjeta (para el LED) */
+static int mb_handle(const uint8_t *f, uint32_t len)
 {
     uint8_t resp[8 + 2 * 32];
 
     if (len < 4 || crc16(f, len) != 0)    /* CRC sobre todo = 0 si ok */
-        return;
+        return 0;
     if (f[0] != g_addr && f[0] != 0)
-        return;                            /* no es para mí */
+        return 0;                          /* no es para mí */
 
     uint8_t  addr = f[0], fc = f[1];
     uint8_t  bcast = (addr == 0);
+
+    /* En el bus también se oyen las RESPUESTAS de otros esclavos. Con
+     * direcciones duplicadas (varias tarjetas en 247) parecerían
+     * peticiones y generarían un ping-pong infinito de excepciones.
+     * Reglas anti-eco: */
+    if (fc & 0x80)
+        return 0;                     /* frame de excepción = respuesta ajena */
+    if (fc == FC_DISCOVERY)
+        return bcast ? mb_discovery(f, len) : 0;  /* unicast 0x41 = respuesta */
+    if (!bcast && g_addr == DEFAULT_ADDR)
+        return 0;                     /* sin configurar: solo discovery/bcast */
 
     if ((fc == 0x03 || fc == 0x04) && len == 8 && !bcast) {
         uint16_t start = (f[2] << 8) | f[3];
@@ -345,7 +438,7 @@ static void mb_handle(const uint8_t *f, uint32_t len)
 
         if (count < 1 || count > 32 || start + count > 10) {
             mb_exception(addr, fc, 2);
-            return;
+            return 1;
         }
         resp[0] = addr;
         resp[1] = fc;
@@ -367,10 +460,10 @@ static void mb_handle(const uint8_t *f, uint32_t len)
         uint8_t  err = holding_write(reg, val);
 
         if (bcast)
-            return;                       /* broadcast: sin respuesta */
+            return 1;                       /* broadcast: sin respuesta */
         if (err) {
             mb_exception(addr, fc, err);
-            return;
+            return 1;
         }
         memcpy(resp, f, 6);               /* eco de la petición */
         uint16_t crc = crc16(resp, 6);
@@ -386,18 +479,18 @@ static void mb_handle(const uint8_t *f, uint32_t len)
         if (count < 1 || count > 3 || bytes != count * 2 ||
             len != 9u + bytes) {
             if (!bcast) mb_exception(addr, fc, 2);
-            return;
+            return 1;
         }
         for (uint16_t i = 0; i < count; i++) {
             uint16_t val = (f[7 + 2 * i] << 8) | f[8 + 2 * i];
             uint8_t  err = holding_write(start + i, val);
             if (err) {
                 if (!bcast) mb_exception(addr, fc, err);
-                return;
+                return 1;
             }
         }
         if (bcast)
-            return;
+            return 1;
         resp[0] = addr; resp[1] = fc;
         resp[2] = f[2]; resp[3] = f[3];
         resp[4] = f[4]; resp[5] = f[5];
@@ -409,6 +502,7 @@ static void mb_handle(const uint8_t *f, uint32_t len)
     } else if (!bcast) {
         mb_exception(addr, fc, 1);        /* illegal function */
     }
+    return 1;
 }
 
 /* ---------- main ---------- */
@@ -416,7 +510,8 @@ static void mb_handle(const uint8_t *f, uint32_t len)
 int main(void)
 {
     uint8_t  frame[64];
-    uint32_t flen = 0, gap = 0, led = 0;
+    uint32_t flen = 0, gap = 0;
+    uint32_t ms = 0, tick = 0, flash_until = 0;
     char     line[80];
 
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
@@ -432,8 +527,9 @@ int main(void)
     {
         const uint16_t *uid = (const uint16_t *)UID_BASE;
         snprintf(line, sizeof(line),
-                 "\r\n== modbus_vbat v1.0  addr=%u cal=%u"
+                 "\r\n== modbus_vbat v%u.%u  addr=%u cal=%u"
                  "  uid=%04X%04X%04X%04X%04X%04X ==\r\n",
+                 FW_VERSION >> 8, FW_VERSION & 0xFF,
                  g_addr, g_cal, uid[5], uid[4], uid[3],
                  uid[2], uid[1], uid[0]);
         dbg_puts(line);
@@ -447,12 +543,15 @@ int main(void)
             gap = 0;
         } else {
             Delay_Us(50);
+            if (++tick >= 20) {           /* ~1 ms de reloj para el LED */
+                tick = 0;
+                ms++;
+            }
             if (flen && ++gap >= GAP_TICKS) {
                 uint16_t old_addr = g_addr, old_cal = g_cal;
 
-                mb_handle(frame, flen);
-                GPIO_SetBits(GPIOA, GPIO_Pin_1);
-                led = 400;                /* destello ~20 ms */
+                if (mb_handle(frame, flen))
+                    flash_until = ms + 40;
 
                 if (g_addr != old_addr || g_cal != old_cal) {
                     snprintf(line, sizeof(line),
@@ -462,8 +561,16 @@ int main(void)
                 flen = 0;
                 gap  = 0;
             }
-            if (led && --led == 0)
-                GPIO_ResetBits(GPIOA, GPIO_Pin_1);
+
+            /* LED según estado/fase */
+            uint8_t on;
+            if ((int32_t)(flash_until - ms) > 0)
+                on = 1;                            /* transacción */
+            else if (g_addr == DEFAULT_ADDR)
+                on = (ms % 200) < 100;             /* sin configurar: 5 Hz */
+            else
+                on = (ms % 2000) < 40;             /* latido cada 2 s */
+            GPIO_WriteBit(GPIOA, GPIO_Pin_1, on ? Bit_SET : Bit_RESET);
         }
     }
 }

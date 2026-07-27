@@ -49,7 +49,8 @@ class Bus:
         termios.tcsetattr(self.fd, termios.TCSANOW, t)
         termios.tcflush(self.fd, termios.TCIOFLUSH)
 
-    def xfer(self, req: bytes, timeout: float = 0.25) -> bytes:
+    def xfer_raw(self, req: bytes, timeout: float = 0.25) -> bytes:
+        """Envía y devuelve TODO lo recibido, incluso basura de colisión."""
         termios.tcflush(self.fd, termios.TCIFLUSH)
         os.write(self.fd, req + struct.pack("<H", crc16(req)))
         buf = b""
@@ -60,10 +61,14 @@ class Bus:
             if chunk:
                 buf += chunk
                 last = time.monotonic()
-            elif last and time.monotonic() - last > 0.02 and len(buf) >= 5:
+            elif last and time.monotonic() - last > 0.03:
                 break
             else:
                 time.sleep(0.002)
+        return buf
+
+    def xfer(self, req: bytes, timeout: float = 0.25) -> bytes:
+        buf = self.xfer_raw(req, timeout)
         if len(buf) < 5 or crc16(buf) != 0:
             return b""
         return buf[:-2]
@@ -82,6 +87,94 @@ class Bus:
 
 def fmt_uid(regs):
     return "".join(f"{w:04X}" for w in reversed(regs))
+
+
+def fmt_uid_bytes(uid12: bytes) -> str:
+    words = struct.unpack("<6H", uid12)
+    return "".join(f"{w:04X}" for w in reversed(words))
+
+
+# ---------- auto-descubrimiento (FC usuario 0x41) ----------
+
+def disc_query(bus, nbits: int, prefix: bytes):
+    """→ ('silence'|'clean'|'collision', uid12|None)"""
+    raw = bus.xfer_raw(bytes([0, 0x41, 0x01, nbits]) + prefix, timeout=0.15)
+    if not raw:
+        return "silence", None
+    if (len(raw) == 19 and crc16(raw) == 0 and
+            raw[0] == 247 and raw[1] == 0x41 and raw[2] == 0x01):
+        return "clean", raw[3:15]
+    return "collision", None
+
+
+def disc_assign(bus, uid12: bytes, new_addr: int) -> bool:
+    req = bytes([0, 0x41, 0x02]) + uid12 + bytes([new_addr])
+    raw = bus.xfer_raw(req, timeout=0.4)      # el guardado borra flash
+    return (len(raw) == 17 and crc16(raw) == 0 and
+            raw[0] == new_addr and raw[1] == 0x41 and raw[2] == 0x02)
+
+
+def disc_find_one(bus):
+    """Desciende el árbol de bits del UID hasta aislar UNA tarjeta."""
+    state, uid = disc_query(bus, 0, bytes(12))
+    if state == "silence":
+        return None
+    if state == "clean":
+        return uid
+    prefix = bytearray(12)
+    for depth in range(96):
+        descended = False
+        for bit in (0, 1):
+            if bit:
+                prefix[depth // 8] |= 0x80 >> (depth % 8)
+            else:
+                prefix[depth // 8] &= ~(0x80 >> (depth % 8)) & 0xFF
+            state, uid = disc_query(bus, depth + 1, bytes(prefix))
+            if state == "clean":
+                return uid
+            if state == "collision":
+                descended = True
+                break
+        if not descended:
+            return None                        # ambas ramas en silencio
+    return None
+
+
+def cmd_discover(bus, assign: bool, start: int):
+    print("Buscando tarjetas sin configurar (addr 247)...")
+    found, next_addr = [], start
+    while True:
+        uid = disc_find_one(bus)
+        if uid is None:
+            break
+        label = fmt_uid_bytes(uid)
+        if not assign:
+            print(f"  UID {label} (sin configurar)")
+            # sin asignar no sale del pool: una sola pasada informativa
+            found.append(uid)
+            break
+        while bus.read_regs(next_addr, 0x04, 0, 1) is not None:
+            next_addr += 1                     # dirección ocupada, saltar
+        if disc_assign(bus, uid, next_addr):
+            check = bus.read_regs(next_addr, 0x04, 0, 1)
+            v = f", VBAT={check[0] / 1000:.3f}V" if check else ""
+            print(f"  UID {label} → addr {next_addr}{v}")
+            found.append(uid)
+            next_addr += 1
+        else:
+            print(f"  UID {label}: falló la asignación, reintento...")
+    if not found:
+        print("  (no hay tarjetas sin configurar en el bus)")
+    elif assign:
+        print(f"Listo: {len(found)} tarjeta(s) direccionada(s).")
+
+
+def cmd_factory_reset(bus, addr: int):
+    if not bus.write_reg(addr, 0, 247):
+        sys.exit(f"addr {addr}: sin respuesta")
+    # guardado por broadcast: sin respuesta esperada (todas persisten)
+    bus.xfer_raw(struct.pack(">BBHH", 0, 0x06, 2, 0xA55A), timeout=0.1)
+    print(f"OK: addr {addr} → 247 (sin configurar, persistido)")
 
 
 def cmd_scan(bus, lo, hi):
@@ -187,6 +280,17 @@ def main():
     s.add_argument("addr", type=int)
     s.add_argument("factor", type=int)
 
+    s = sub.add_parser("discover",
+                       help="enumera tarjetas sin configurar por UID")
+    s.add_argument("--assign", action="store_true",
+                   help="asignarles direcciones automáticamente")
+    s.add_argument("--start", type=int, default=1,
+                   help="primera dirección candidata (def. 1)")
+
+    s = sub.add_parser("factory-reset",
+                       help="devuelve una tarjeta al estado sin configurar")
+    s.add_argument("addr", type=int)
+
     a = ap.parse_args()
     bus = Bus(a.port)
 
@@ -202,6 +306,10 @@ def main():
         cmd_set_cal(bus, a.addr, a.real_mv)
     elif a.cmd == "set-cal-raw":
         cmd_set_cal_raw(bus, a.addr, a.factor)
+    elif a.cmd == "discover":
+        cmd_discover(bus, a.assign, a.start)
+    elif a.cmd == "factory-reset":
+        cmd_factory_reset(bus, a.addr)
 
 
 if __name__ == "__main__":
