@@ -21,6 +21,17 @@
 #define DE_PORT GPIOB
 #define DE_PIN  GPIO_Pin_12
 
+/* Identidad y cadencia por tarjeta — se fijan al compilar:
+ *   make flash BOARD_ID=B2 PERIOD_MS=1300
+ * Períodos distintos por tarjeta evitan colisiones sistemáticas en el
+ * bus compartido (protocolo maestro-esclavo real vendrá después). */
+#ifndef BOARD_ID
+#define BOARD_ID   "B?"
+#endif
+#ifndef PERIOD_MS
+#define PERIOD_MS  900
+#endif
+
 /* Divisor R10/R11: Vbat = Vadc * (47K+10K)/10K = Vadc * 5.7 */
 #define VREF_MV      3300u
 #define DIV_NUM      57u
@@ -206,7 +217,7 @@ int main(void)
         uint32_t adc_mv  = (uint32_t)raw * VREF_MV / 4095u;
         uint32_t vbat_mv = adc_mv * DIV_NUM / DIV_DEN;
 
-        snprintf(line, sizeof(line), "VBAT=%lu.%03luV (raw=%u adc=%lumV)\r\n",
+        snprintf(line, sizeof(line), BOARD_ID " VBAT=%lu.%03luV (raw=%u adc=%lumV)\r\n",
                  (unsigned long)(vbat_mv / 1000u),
                  (unsigned long)(vbat_mv % 1000u),
                  raw, (unsigned long)adc_mv);
@@ -215,6 +226,6 @@ int main(void)
         dbg_puts(line);
 
         GPIO_ResetBits(GPIOA, GPIO_Pin_1);
-        Delay_Ms(900);
+        Delay_Ms(PERIOD_MS);
     }
 }
