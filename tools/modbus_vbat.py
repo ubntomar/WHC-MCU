@@ -21,8 +21,21 @@ import sys
 import termios
 import time
 
-DEF_PORT = "/dev/ttyACM0"
 BAUD = termios.B115200
+
+
+def default_port() -> str:
+    """Primer adaptador serie USB disponible (portable entre SBCs:
+    Orange Pi, Raspberry Pi, Banana Pi... ttyACM* o ttyUSB*)."""
+    import glob
+    for pat in ("/dev/ttyACM*", "/dev/ttyUSB*"):
+        devs = sorted(glob.glob(pat))
+        if devs:
+            return devs[0]
+    return "/dev/ttyACM0"
+
+
+DEF_PORT = default_port()
 
 
 def crc16(data: bytes) -> int:
