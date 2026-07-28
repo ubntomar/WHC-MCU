@@ -304,9 +304,13 @@ def cmd_log(bus, addr, since):
     cursor = start
     while cursor <= newest:
         req = struct.pack(">BBIB", addr, 0x43, cursor, 12)
-        raw = bus.xfer_raw(req, timeout=0.5)
-        if len(raw) < 5 or crc16(raw) != 0 or raw[0] != addr or raw[1] != 0x43:
-            sys.exit(f"error leyendo desde seq {cursor}")
+        for retry in range(3):
+            raw = bus.xfer_raw(req, timeout=0.5)
+            if (len(raw) >= 5 and crc16(raw) == 0 and
+                    raw[0] == addr and raw[1] == 0x43):
+                break
+        else:
+            sys.exit(f"error leyendo desde seq {cursor} tras 3 intentos")
         n = raw[2]
         if n == 0:
             break
