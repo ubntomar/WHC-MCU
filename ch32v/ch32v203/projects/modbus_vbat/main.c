@@ -14,11 +14,19 @@
  *     2  voltaje en el pin ADC en mV
  *     3  versión de firmware (0x0100 = v1.0)
  *     4..9  UID de fábrica de 96 bits (ESIG), 6 palabras
+ *     10 causa del último reset (bit0=PIN bit1=POR bit2=SOFT
+ *        bit3=IWDG bit4=WWDG bit5=LOWPWR)
  *
  *   Holding registers (FC 0x03 / 0x06 / 0x10):
  *     0  dirección esclavo (1-247)
  *     1  factor de calibración ×10000 (10000 = neutro)
  *     2  clave de guardado: escribir 0xA55A persiste addr+cal en flash
+ *     3  prueba de watchdog: escribir 0xDEAD cuelga el firmware a
+ *        propósito → el IWDG debe resetear la tarjeta en ~6.5 s
+ *
+ * WATCHDOG: IWDG por LSI (~40 kHz /64, recarga 4095) ≈ 6.5 s. Se
+ * alimenta en el lazo principal; cualquier cuelgue → reset automático.
+ * La causa del reset queda en el input reg 10 (y en el banner de debug).
  *
  * El esclavo jamás transmite sin ser interrogado → bus sin colisiones
  * por diseño (el maestro sondea cada dirección).
@@ -41,7 +49,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION   0x0103
+#define FW_VERSION   0x0104
+#define HANG_KEY     0xDEADu
 #define FC_DISCOVERY 0x41
 
 /*
@@ -79,6 +88,32 @@ typedef struct {
 
 static uint16_t g_addr = DEFAULT_ADDR;
 static uint16_t g_cal  = DEFAULT_CAL;
+static uint16_t g_reset_cause;            /* bitfield, ver input reg 10 */
+static uint8_t  g_hang_request;           /* prueba de watchdog pedida */
+
+/* ---------- watchdog ---------- */
+
+static void iwdg_init(void)
+{
+    /* LSI ~40 kHz / 64 = 625 Hz; recarga 4095 → timeout ≈ 6.5 s */
+    IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
+    IWDG_SetPrescaler(IWDG_Prescaler_64);
+    IWDG_SetReload(0xFFF);
+    IWDG_ReloadCounter();
+    IWDG_Enable();
+}
+
+static void reset_cause_init(void)
+{
+    g_reset_cause =
+        (RCC_GetFlagStatus(RCC_FLAG_PINRST)  == SET ? 1u << 0 : 0) |
+        (RCC_GetFlagStatus(RCC_FLAG_PORRST)  == SET ? 1u << 1 : 0) |
+        (RCC_GetFlagStatus(RCC_FLAG_SFTRST)  == SET ? 1u << 2 : 0) |
+        (RCC_GetFlagStatus(RCC_FLAG_IWDGRST) == SET ? 1u << 3 : 0) |
+        (RCC_GetFlagStatus(RCC_FLAG_WWDGRST) == SET ? 1u << 4 : 0) |
+        (RCC_GetFlagStatus(RCC_FLAG_LPWRRST) == SET ? 1u << 5 : 0);
+    RCC_ClearFlag();                      /* que el próximo boot sea limpio */
+}
 
 /* ---------- config en flash ---------- */
 
@@ -299,6 +334,7 @@ static uint16_t input_reg(uint16_t idx)
     case 3: return FW_VERSION;
     case 4: case 5: case 6: case 7: case 8: case 9:
         return uid[idx - 4];
+    case 10: return g_reset_cause;
     default: return 0;
     }
 }
@@ -330,6 +366,11 @@ static uint8_t holding_write(uint16_t idx, uint16_t val)
         if (val != SAVE_KEY)
             return 3;
         return cfg_save() ? 4 : 0;        /* 4 = slave device failure */
+    case 3:
+        if (val != HANG_KEY)
+            return 3;
+        g_hang_request = 1;               /* se cuelga tras responder */
+        return 0;
     default:
         return 2;                         /* illegal data address */
     }
@@ -436,7 +477,7 @@ static int mb_handle(const uint8_t *f, uint32_t len)
         uint16_t start = (f[2] << 8) | f[3];
         uint16_t count = (f[4] << 8) | f[5];
 
-        if (count < 1 || count > 32 || start + count > 10) {
+        if (count < 1 || count > 32 || start + count > 11) {
             mb_exception(addr, fc, 2);
             return 1;
         }
@@ -523,15 +564,18 @@ int main(void)
     rs485_init(115200);
     adc_init();
     cfg_load();
+    reset_cause_init();
+    iwdg_init();
 
     {
         const uint16_t *uid = (const uint16_t *)UID_BASE;
         snprintf(line, sizeof(line),
                  "\r\n== modbus_vbat v%u.%u  addr=%u cal=%u"
-                 "  uid=%04X%04X%04X%04X%04X%04X ==\r\n",
+                 "  uid=%04X%04X%04X%04X%04X%04X  rst=0x%02X%s ==\r\n",
                  FW_VERSION >> 8, FW_VERSION & 0xFF,
                  g_addr, g_cal, uid[5], uid[4], uid[3],
-                 uid[2], uid[1], uid[0]);
+                 uid[2], uid[1], uid[0], g_reset_cause,
+                 (g_reset_cause & (1u << 3)) ? " (WATCHDOG!)" : "");
         dbg_puts(line);
     }
 
@@ -547,11 +591,21 @@ int main(void)
                 tick = 0;
                 ms++;
             }
+            IWDG_ReloadCounter();         /* alimentar el perro */
+
             if (flen && ++gap >= GAP_TICKS) {
                 uint16_t old_addr = g_addr, old_cal = g_cal;
 
                 if (mb_handle(frame, flen))
                     flash_until = ms + 40;
+
+                if (g_hang_request) {      /* prueba de watchdog */
+                    dbg_puts("[test] cuelgue intencional — "
+                             "esperando reset del IWDG...\r\n");
+                    GPIO_SetBits(GPIOA, GPIO_Pin_1);
+                    while (1)
+                        ;                  /* sin alimentar el perro */
+                }
 
                 if (g_addr != old_addr || g_cal != old_cal) {
                     snprintf(line, sizeof(line),

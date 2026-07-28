@@ -204,8 +204,18 @@ def cmd_scan(bus, lo, hi):
     return found
 
 
+RESET_BITS = ["PIN", "POR", "SOFT", "IWDG", "WWDG", "LOWPWR"]
+
+
+def fmt_reset(cause: int) -> str:
+    names = [n for i, n in enumerate(RESET_BITS) if cause & (1 << i)]
+    return "+".join(names) if names else "?"
+
+
 def cmd_read(bus, addr):
-    inp = bus.read_regs(addr, 0x04, 0, 10)
+    inp = bus.read_regs(addr, 0x04, 0, 11)
+    if inp is None:                        # firmware < v1.4: sin reg 10
+        inp = bus.read_regs(addr, 0x04, 0, 10)
     hold = bus.read_regs(addr, 0x03, 0, 2)
     if inp is None or hold is None:
         sys.exit(f"addr {addr}: sin respuesta")
@@ -216,6 +226,25 @@ def cmd_read(bus, addr):
     print(f"  firmware  = v{inp[3] >> 8}.{inp[3] & 0xFF}")
     print(f"  UID       = {fmt_uid(inp[4:10])}")
     print(f"  cal       = {hold[1]} (x10000)")
+    if len(inp) > 10:
+        print(f"  últ.reset = {fmt_reset(inp[10])} (0x{inp[10]:02X})")
+
+
+def cmd_hang_test(bus, addr):
+    print(f"Enviando cuelgue intencional a addr {addr}...")
+    if not bus.write_reg(addr, 3, 0xDEAD):
+        sys.exit(f"addr {addr}: sin respuesta")
+    print("Firmware colgado (LED fijo). Esperando reset por IWDG (~7 s)...")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 15:
+        time.sleep(1)
+        regs = bus.read_regs(addr, 0x04, 10, 1)
+        if regs is not None:
+            dt = time.monotonic() - t0
+            print(f"¡Revivió a los {dt:.1f} s!  causa del reset: "
+                  f"{fmt_reset(regs[0])} (0x{regs[0]:02X})")
+            return
+    sys.exit("no revivió en 15 s — revisar")
 
 
 def cmd_monitor(bus, addrs, interval):
@@ -304,6 +333,11 @@ def main():
                        help="devuelve una tarjeta al estado sin configurar")
     s.add_argument("addr", type=int)
 
+    s = sub.add_parser("hang-test",
+                       help="cuelga el firmware a propósito y verifica "
+                            "que el watchdog lo resucite")
+    s.add_argument("addr", type=int)
+
     a = ap.parse_args()
     bus = Bus(a.port)
 
@@ -323,6 +357,8 @@ def main():
         cmd_discover(bus, a.assign, a.start)
     elif a.cmd == "factory-reset":
         cmd_factory_reset(bus, a.addr)
+    elif a.cmd == "hang-test":
+        cmd_hang_test(bus, a.addr)
 
 
 if __name__ == "__main__":
