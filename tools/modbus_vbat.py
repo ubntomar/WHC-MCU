@@ -92,10 +92,15 @@ class Bus:
             return None
         return list(struct.unpack(f">{count}H", r[3:3 + count * 2]))
 
-    def write_reg(self, addr: int, reg: int, val: int) -> bool:
+    def write_reg(self, addr: int, reg: int, val: int,
+                  timeout: float = 0.25) -> bool:
         req = struct.pack(">BBHH", addr, 0x06, reg, val)
-        r = self.xfer(req)
+        r = self.xfer(req, timeout)
         return r == req
+
+    def save_cfg(self, addr: int) -> bool:
+        """Persistir en flash: el borrado de página puede tardar >250 ms."""
+        return self.write_reg(addr, 2, 0xA55A, timeout=1.5)
 
 
 def fmt_uid(regs):
@@ -212,11 +217,21 @@ def fmt_reset(cause: int) -> str:
     return "+".join(names) if names else "?"
 
 
+ALARM_BITS = ["BAJA-activa", "ALTA-activa", "BAJA-ocurrió", "ALTA-ocurrió"]
+
+
+def fmt_alarm(bits: int) -> str:
+    names = [n for i, n in enumerate(ALARM_BITS) if bits & (1 << i)]
+    return " ".join(names) if names else "sin alarmas"
+
+
 def cmd_read(bus, addr):
-    inp = bus.read_regs(addr, 0x04, 0, 11)
-    if inp is None:                        # firmware < v1.4: sin reg 10
-        inp = bus.read_regs(addr, 0x04, 0, 10)
-    hold = bus.read_regs(addr, 0x03, 0, 2)
+    inp = None
+    for count in (14, 11, 10):             # v1.5 / v1.4 / anteriores
+        inp = bus.read_regs(addr, 0x04, 0, count)
+        if inp is not None:
+            break
+    hold = bus.read_regs(addr, 0x03, 0, 7) or bus.read_regs(addr, 0x03, 0, 2)
     if inp is None or hold is None:
         sys.exit(f"addr {addr}: sin respuesta")
     print(f"addr {addr}:")
@@ -228,6 +243,31 @@ def cmd_read(bus, addr):
     print(f"  cal       = {hold[1]} (x10000)")
     if len(inp) > 10:
         print(f"  últ.reset = {fmt_reset(inp[10])} (0x{inp[10]:02X})")
+    if len(inp) > 13:
+        print(f"  alarmas   = {fmt_alarm(inp[11])} (0x{inp[11]:02X})")
+        print(f"  Vmín/Vmáx = {inp[12] / 1000:.3f} / {inp[13] / 1000:.3f} V")
+        if len(hold) > 6:
+            lo = f"{hold[4] / 1000:.3f}V" if hold[4] else "off"
+            hi = f"{hold[5] / 1000:.3f}V" if hold[5] else "off"
+            print(f"  umbrales  = baja {lo}, alta {hi}, hist {hold[6]} mV")
+
+
+def cmd_set_alarm(bus, addr, lo_mv, hi_mv, hyst):
+    for reg, val in ((4, lo_mv), (5, hi_mv)) + \
+                    (((6, hyst),) if hyst is not None else ()):
+        if not bus.write_reg(addr, reg, val):
+            sys.exit(f"addr {addr}: falló escritura reg {reg}")
+    if not bus.save_cfg(addr):
+        sys.exit("falló el guardado en flash")
+    lo = f"{lo_mv / 1000:.3f}V" if lo_mv else "off"
+    hi = f"{hi_mv / 1000:.3f}V" if hi_mv else "off"
+    print(f"OK addr {addr}: alarma baja {lo}, alta {hi} (persistido)")
+
+
+def cmd_alarm_clear(bus, addr):
+    if not bus.write_reg(addr, 7, 1):
+        sys.exit(f"addr {addr}: sin respuesta")
+    print(f"OK addr {addr}: latches limpiados, Vmín/Vmáx reiniciados")
 
 
 def cmd_hang_test(bus, addr):
@@ -252,9 +292,16 @@ def cmd_monitor(bus, addrs, interval):
     while True:
         parts = []
         for a in addrs:
-            regs = bus.read_regs(a, 0x04, 0, 1)
-            parts.append(f"[{a}] {regs[0] / 1000:.3f}V" if regs
-                         else f"[{a}] ---")
+            regs = bus.read_regs(a, 0x04, 0, 12)   # v1.5: con alarmas
+            if regs is None:
+                regs = bus.read_regs(a, 0x04, 0, 1)
+            if regs is None:
+                parts.append(f"[{a}] ---")
+                continue
+            s = f"[{a}] {regs[0] / 1000:.3f}V"
+            if len(regs) > 11 and regs[11] & 0x03:
+                s += " ⚠" + ("BAJA" if regs[11] & 1 else "ALTA")
+            parts.append(s)
         print(time.strftime("%H:%M:%S"), "  ".join(parts))
         time.sleep(interval)
 
@@ -262,7 +309,7 @@ def cmd_monitor(bus, addrs, interval):
 def cmd_set_addr(bus, cur, new):
     if not bus.write_reg(cur, 0, new):
         sys.exit(f"addr {cur}: no respondió al cambio de dirección")
-    if not bus.write_reg(new, 2, 0xA55A):
+    if not bus.save_cfg(new):
         sys.exit(f"addr {new}: respondió al cambio pero falló el guardado")
     print(f"OK: la tarjeta ahora es addr {new} (persistido en flash)")
 
@@ -278,7 +325,7 @@ def cmd_set_cal(bus, addr, real_mv):
         sys.exit(f"factor resultante {cal_new} fuera de rango — ¿mV correctos?")
     if not bus.write_reg(addr, 1, cal_new):
         sys.exit("falló la escritura de calibración")
-    if not bus.write_reg(addr, 2, 0xA55A):
+    if not bus.save_cfg(addr):
         sys.exit("falló el guardado en flash")
     check = bus.read_regs(addr, 0x04, 0, 1)
     print(f"OK: cal {cal_old} → {cal_new} (persistido)")
@@ -289,7 +336,7 @@ def cmd_set_cal(bus, addr, real_mv):
 def cmd_set_cal_raw(bus, addr, factor):
     if not bus.write_reg(addr, 1, factor):
         sys.exit("falló la escritura de calibración")
-    if not bus.write_reg(addr, 2, 0xA55A):
+    if not bus.save_cfg(addr):
         sys.exit("falló el guardado en flash")
     print(f"OK: cal={factor} persistido en addr {addr}")
 
@@ -338,6 +385,18 @@ def main():
                             "que el watchdog lo resucite")
     s.add_argument("addr", type=int)
 
+    s = sub.add_parser("set-alarm",
+                       help="umbrales de alarma en mV (0 = deshabilitar)")
+    s.add_argument("addr", type=int)
+    s.add_argument("lo_mv", type=int, help="umbral bajo en mV (0=off)")
+    s.add_argument("hi_mv", type=int, help="umbral alto en mV (0=off)")
+    s.add_argument("--hyst", type=int, default=None,
+                   help="histéresis en mV (def. actual de la tarjeta)")
+
+    s = sub.add_parser("alarm-clear",
+                       help="limpia latches y reinicia Vmín/Vmáx")
+    s.add_argument("addr", type=int)
+
     a = ap.parse_args()
     bus = Bus(a.port)
 
@@ -359,6 +418,10 @@ def main():
         cmd_factory_reset(bus, a.addr)
     elif a.cmd == "hang-test":
         cmd_hang_test(bus, a.addr)
+    elif a.cmd == "set-alarm":
+        cmd_set_alarm(bus, a.addr, a.lo_mv, a.hi_mv, a.hyst)
+    elif a.cmd == "alarm-clear":
+        cmd_alarm_clear(bus, a.addr)
 
 
 if __name__ == "__main__":

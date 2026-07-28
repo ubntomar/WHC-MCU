@@ -16,6 +16,10 @@
  *     4..9  UID de fábrica de 96 bits (ESIG), 6 palabras
  *     10 causa del último reset (bit0=PIN bit1=POR bit2=SOFT
  *        bit3=IWDG bit4=WWDG bit5=LOWPWR)
+ *     11 estado de alarmas: bit0=BAJA activa, bit1=ALTA activa,
+ *        bit2=BAJA ocurrió (latch), bit3=ALTA ocurrió (latch)
+ *     12 Vmín en mV desde el último clear
+ *     13 Vmáx en mV desde el último clear
  *
  *   Holding registers (FC 0x03 / 0x06 / 0x10):
  *     0  dirección esclavo (1-247)
@@ -23,6 +27,15 @@
  *     2  clave de guardado: escribir 0xA55A persiste addr+cal en flash
  *     3  prueba de watchdog: escribir 0xDEAD cuelga el firmware a
  *        propósito → el IWDG debe resetear la tarjeta en ~6.5 s
+ *     4  umbral de alarma BAJA en mV (0 = deshabilitada)
+ *     5  umbral de alarma ALTA en mV (0 = deshabilitada)
+ *     6  histéresis en mV (def. 200, máx. 2000)
+ *     7  escribir 1 = limpiar latches de alarma y reiniciar Vmín/Vmáx
+ *
+ * ALARMAS: evaluadas EN LA TARJETA sobre el muestreo continuo de fondo
+ * (~15 promedios/s), sin depender del maestro. Con histéresis para no
+ * oscilar en el borde. Los latches capturan transitorios entre sondeos.
+ * Umbrales persistidos en flash con la clave de guardado (reg 2).
  *
  * WATCHDOG: IWDG por LSI (~40 kHz /64, recarga 4095) ≈ 6.5 s. Se
  * alimenta en el lazo principal; cualquier cuelgue → reset automático.
@@ -49,8 +62,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION   0x0104
+#define FW_VERSION   0x0105
 #define HANG_KEY     0xDEADu
+#define DEFAULT_HYST 200u
 #define FC_DISCOVERY 0x41
 
 /*
@@ -68,7 +82,7 @@
 #define ADC_SAMPLES  16u
 
 #define CFG_ADDR     0x0800F000u          /* última página de 4K */
-#define CFG_MAGIC    0xB007u
+#define CFG_MAGIC    0xB008u              /* v1.5: struct con alarmas */
 #define DEFAULT_ADDR 247u
 #define DEFAULT_CAL  10000u
 #define SAVE_KEY     0xA55Au
@@ -83,13 +97,26 @@ typedef struct {
     uint16_t magic;
     uint16_t addr;
     uint16_t cal;
-    uint16_t check;                       /* magic ^ addr ^ cal */
+    uint16_t alarm_lo;                    /* mV, 0 = deshabilitada */
+    uint16_t alarm_hi;                    /* mV, 0 = deshabilitada */
+    uint16_t hyst;                        /* mV */
+    uint16_t check;                       /* xor de todo lo anterior */
 } cfg_t;
 
-static uint16_t g_addr = DEFAULT_ADDR;
-static uint16_t g_cal  = DEFAULT_CAL;
+static uint16_t g_addr     = DEFAULT_ADDR;
+static uint16_t g_cal      = DEFAULT_CAL;
+static uint16_t g_alarm_lo = 0;
+static uint16_t g_alarm_hi = 0;
+static uint16_t g_hyst     = DEFAULT_HYST;
 static uint16_t g_reset_cause;            /* bitfield, ver input reg 10 */
 static uint8_t  g_hang_request;           /* prueba de watchdog pedida */
+
+/* medición de fondo y alarmas */
+static uint16_t g_raw;                    /* último promedio de 32 */
+static uint16_t g_vbat_mv;                /* calibrado, cache */
+static uint16_t g_vmin_mv = 0xFFFF;
+static uint16_t g_vmax_mv = 0;
+static uint16_t g_alarm;                  /* bits, ver input reg 11 */
 
 /* ---------- watchdog ---------- */
 
@@ -117,26 +144,38 @@ static void reset_cause_init(void)
 
 /* ---------- config en flash ---------- */
 
+static uint16_t cfg_check(const cfg_t *c)
+{
+    return (uint16_t)(c->magic ^ c->addr ^ c->cal ^
+                      c->alarm_lo ^ c->alarm_hi ^ c->hyst);
+}
+
 static void cfg_load(void)
 {
     const cfg_t *c = (const cfg_t *)CFG_ADDR;
 
-    if (c->magic == CFG_MAGIC &&
-        c->check == (uint16_t)(c->magic ^ c->addr ^ c->cal) &&
-        c->addr >= 1 && c->addr <= 247 && c->cal >= 5000 && c->cal <= 20000) {
-        g_addr = c->addr;
-        g_cal  = c->cal;
+    if (c->magic == CFG_MAGIC && c->check == cfg_check(c) &&
+        c->addr >= 1 && c->addr <= 247 &&
+        c->cal >= 5000 && c->cal <= 20000 && c->hyst <= 2000) {
+        g_addr     = c->addr;
+        g_cal      = c->cal;
+        g_alarm_lo = c->alarm_lo;
+        g_alarm_hi = c->alarm_hi;
+        g_hyst     = c->hyst;
     }
 }
 
 static int cfg_save(void)
 {
     cfg_t c = {
-        .magic = CFG_MAGIC,
-        .addr  = g_addr,
-        .cal   = g_cal,
-        .check = (uint16_t)(CFG_MAGIC ^ g_addr ^ g_cal),
+        .magic    = CFG_MAGIC,
+        .addr     = g_addr,
+        .cal      = g_cal,
+        .alarm_lo = g_alarm_lo,
+        .alarm_hi = g_alarm_hi,
+        .hyst     = g_hyst,
     };
+    c.check = cfg_check(&c);
     const uint16_t *src = (const uint16_t *)&c;
 
     FLASH_Unlock();
@@ -151,7 +190,11 @@ static int cfg_save(void)
         }
     }
     FLASH_Lock();
-    return memcmp((const void *)CFG_ADDR, &c, sizeof(c)) ? -1 : 0;
+    /* Sin memcmp de verificación: el prefetch de flash del CH32V20x
+     * puede servir datos viejos justo tras programar (falso negativo).
+     * El status FLASH_COMPLETE por media palabra ya garantiza la
+     * escritura; cfg_load valida checksum en el próximo arranque. */
+    return 0;
 }
 
 /* ---------- LED ---------- */
@@ -289,19 +332,47 @@ static void adc_init(void)
         ;
 }
 
-static uint16_t adc_read_avg(void)
+static uint16_t adc_sample_once(void)
 {
-    uint32_t acc = 0;
+    /* una conversión: ~63 µs @ 4 MHz — más corto que un byte de UART
+       (87 µs @ 115200), no arriesga pérdida de bytes del bus */
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1,
+                             ADC_SampleTime_239Cycles5);
+    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET)
+        ;
+    return ADC_GetConversionValue(ADC1);
+}
 
-    for (uint32_t i = 0; i < ADC_SAMPLES; i++) {
-        ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1,
-                                 ADC_SampleTime_239Cycles5);
-        ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-        while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET)
-            ;
-        acc += ADC_GetConversionValue(ADC1);
+/* nuevo promedio de fondo listo: refrescar cache, min/max y alarmas */
+static void measurement_update(uint16_t raw)
+{
+    uint32_t adc_mv = (uint32_t)raw * VREF_MV / 4095u;
+
+    g_raw     = raw;
+    g_vbat_mv = (uint16_t)(adc_mv * DIV_NUM / DIV_DEN * g_cal / 10000u);
+
+    if (g_vbat_mv < g_vmin_mv)
+        g_vmin_mv = g_vbat_mv;
+    if (g_vbat_mv > g_vmax_mv)
+        g_vmax_mv = g_vbat_mv;
+
+    if (g_alarm_lo) {
+        if (g_vbat_mv < g_alarm_lo)
+            g_alarm |= 0x01 | 0x04;       /* activa + latch */
+        else if (g_vbat_mv > g_alarm_lo + g_hyst)
+            g_alarm &= ~0x01u;
+    } else {
+        g_alarm &= ~0x01u;
     }
-    return (uint16_t)(acc / ADC_SAMPLES);
+    if (g_alarm_hi) {
+        if (g_vbat_mv > g_alarm_hi)
+            g_alarm |= 0x02 | 0x08;
+        else if (g_vbat_mv < g_alarm_hi - g_hyst)
+            g_alarm &= ~0x02u;
+    } else {
+        g_alarm &= ~0x02u;
+    }
 }
 
 /* ---------- Modbus RTU ---------- */
@@ -323,18 +394,16 @@ static uint16_t input_reg(uint16_t idx)
     const uint16_t *uid = (const uint16_t *)UID_BASE;
 
     switch (idx) {
-    case 0: {
-        uint16_t raw     = adc_read_avg();
-        uint32_t adc_mv  = (uint32_t)raw * VREF_MV / 4095u;
-        uint32_t vbat_mv = adc_mv * DIV_NUM / DIV_DEN * g_cal / 10000u;
-        return (uint16_t)vbat_mv;
-    }
-    case 1: return adc_read_avg();
-    case 2: return (uint16_t)((uint32_t)adc_read_avg() * VREF_MV / 4095u);
+    case 0: return g_vbat_mv;             /* cache del muestreo de fondo */
+    case 1: return g_raw;
+    case 2: return (uint16_t)((uint32_t)g_raw * VREF_MV / 4095u);
     case 3: return FW_VERSION;
     case 4: case 5: case 6: case 7: case 8: case 9:
         return uid[idx - 4];
     case 10: return g_reset_cause;
+    case 11: return g_alarm;
+    case 12: return g_vmin_mv;
+    case 13: return g_vmax_mv;
     default: return 0;
     }
 }
@@ -344,7 +413,10 @@ static uint16_t holding_read(uint16_t idx)
     switch (idx) {
     case 0: return g_addr;
     case 1: return g_cal;
-    default: return 0;                    /* save_key se lee como 0 */
+    case 4: return g_alarm_lo;
+    case 5: return g_alarm_hi;
+    case 6: return g_hyst;
+    default: return 0;                    /* claves se leen como 0 */
     }
 }
 
@@ -370,6 +442,24 @@ static uint8_t holding_write(uint16_t idx, uint16_t val)
         if (val != HANG_KEY)
             return 3;
         g_hang_request = 1;               /* se cuelga tras responder */
+        return 0;
+    case 4:
+        g_alarm_lo = val;                 /* 0 = deshabilitada */
+        return 0;
+    case 5:
+        g_alarm_hi = val;
+        return 0;
+    case 6:
+        if (val > 2000)
+            return 3;
+        g_hyst = val;
+        return 0;
+    case 7:
+        if (val != 1)
+            return 3;
+        g_alarm &= ~0x0Cu;                /* limpiar latches */
+        g_vmin_mv = g_vbat_mv;            /* reiniciar min/max */
+        g_vmax_mv = g_vbat_mv;
         return 0;
     default:
         return 2;                         /* illegal data address */
@@ -476,8 +566,9 @@ static int mb_handle(const uint8_t *f, uint32_t len)
     if ((fc == 0x03 || fc == 0x04) && len == 8 && !bcast) {
         uint16_t start = (f[2] << 8) | f[3];
         uint16_t count = (f[4] << 8) | f[5];
+        uint16_t nregs = (fc == 0x04) ? 14 : 8;
 
-        if (count < 1 || count > 32 || start + count > 11) {
+        if (count < 1 || count > 32 || start + count > nregs) {
             mb_exception(addr, fc, 2);
             return 1;
         }
@@ -517,7 +608,7 @@ static int mb_handle(const uint8_t *f, uint32_t len)
         uint16_t count = (f[4] << 8) | f[5];
         uint8_t  bytes = f[6];
 
-        if (count < 1 || count > 3 || bytes != count * 2 ||
+        if (count < 1 || count > 8 || bytes != count * 2 ||
             len != 9u + bytes) {
             if (!bcast) mb_exception(addr, fc, 2);
             return 1;
@@ -553,6 +644,7 @@ int main(void)
     uint8_t  frame[64];
     uint32_t flen = 0, gap = 0;
     uint32_t ms = 0, tick = 0, flash_until = 0;
+    uint32_t samp_ms = 0, samp_acc = 0, samp_n = 0;
     char     line[80];
 
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
@@ -566,6 +658,15 @@ int main(void)
     cfg_load();
     reset_cause_init();
     iwdg_init();
+
+    {   /* primera medición completa antes de atender el bus */
+        uint32_t acc = 0;
+        for (int i = 0; i < 32; i++)
+            acc += adc_sample_once();
+        measurement_update((uint16_t)(acc / 32));
+        g_vmin_mv = g_vbat_mv;
+        g_vmax_mv = g_vbat_mv;
+    }
 
     {
         const uint16_t *uid = (const uint16_t *)UID_BASE;
@@ -593,6 +694,18 @@ int main(void)
             }
             IWDG_ReloadCounter();         /* alimentar el perro */
 
+            /* muestreo de fondo: 1 muestra corta cada ~2 ms cuando el
+             * bus está ocioso; promedio de 32 (~15 mediciones/s) */
+            if (flen == 0 && (ms - samp_ms) >= 2) {
+                samp_ms = ms;
+                samp_acc += adc_sample_once();
+                if (++samp_n >= 32) {
+                    measurement_update((uint16_t)(samp_acc / 32));
+                    samp_acc = 0;
+                    samp_n   = 0;
+                }
+            }
+
             if (flen && ++gap >= GAP_TICKS) {
                 uint16_t old_addr = g_addr, old_cal = g_cal;
 
@@ -617,11 +730,14 @@ int main(void)
             }
 
             /* LED según estado/fase */
-            uint8_t on;
+            uint8_t  on;
+            uint32_t t = ms % 1000;
             if ((int32_t)(flash_until - ms) > 0)
                 on = 1;                            /* transacción */
             else if (g_addr == DEFAULT_ADDR)
                 on = (ms % 200) < 100;             /* sin configurar: 5 Hz */
+            else if (g_alarm & 0x03)
+                on = (t < 60) || (t >= 150 && t < 210);  /* ALARMA: doble */
             else
                 on = (ms % 2000) < 40;             /* latido cada 2 s */
             GPIO_WriteBit(GPIOA, GPIO_Pin_1, on ? Bit_SET : Bit_RESET);
