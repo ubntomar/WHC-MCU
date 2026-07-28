@@ -16,11 +16,11 @@ $(BUILD)/combined.bin: all
 b=open('$(BOOT)/build/boot485.bin','rb').read(); \
 a=open('$(BUILD)/$(TARGET).bin','rb').read(); \
 a+= b'\xff'*(len(a)%2); \
-assert len(b)<=8192 and len(a)<=0xCFF0; \
+assert len(b)<=8192 and len(a)<=0x7FF0; \
 crc=zlib.crc32(a)&0xFFFFFFFF; \
 tr=struct.pack('<III',0xA5B007A5,len(a),crc)+b'\xff'*4; \
-img=b+b'\xff'*(8192-len(b))+a+b'\xff'*(0xCFF0-len(a))+tr; \
-assert len(img)==0xF000; \
+img=b+b'\xff'*(8192-len(b))+a+b'\xff'*(0x7FF0-len(a))+tr; \
+assert len(img)==0xA000; \
 open('$(BUILD)/combined.bin','wb').write(img); \
 print(f'combined: boot={len(b)} app={len(a)} crc={crc:08X} (con trailer)')"
 

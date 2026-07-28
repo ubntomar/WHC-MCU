@@ -15,7 +15,7 @@ MEMORY
 
 /* CH32V20x_D6 - CH32V203K8-CH32V203C8-CH32V203G8-CH32V203F8 */
 /**/
-	FLASH (rx) : ORIGIN = 0x00002000, LENGTH = 0xCFF0 /* app: 52K-16 (trailer en 0xEFF0) */
+	FLASH (rx) : ORIGIN = 0x00002000, LENGTH = 0x7FF0 /* app: 32K-16 (trailer en 0x9FF0) */
 	RAM (xrw) : ORIGIN = 0x20000000, LENGTH = 0x4FF0 /* 20K-16: 0x20004FF0 = bandera boot */
  
   

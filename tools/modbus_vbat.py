@@ -227,7 +227,7 @@ def fmt_alarm(bits: int) -> str:
 
 def cmd_read(bus, addr):
     inp = None
-    for count in (14, 11, 10):             # v1.5 / v1.4 / anteriores
+    for count in (21, 14, 11, 10):         # v2.0 / v1.5 / v1.4 / anteriores
         inp = bus.read_regs(addr, 0x04, 0, count)
         if inp is not None:
             break
@@ -250,6 +250,18 @@ def cmd_read(bus, addr):
             lo = f"{hold[4] / 1000:.3f}V" if hold[4] else "off"
             hi = f"{hold[5] / 1000:.3f}V" if hold[5] else "off"
             print(f"  umbrales  = baja {lo}, alta {hi}, hist {hold[6]} mV")
+    if len(inp) > 20:
+        new = (inp[14] << 16) | inp[15]
+        old = (inp[16] << 16) | inp[17]
+        upm = (inp[18] << 16) | inp[19]
+        print(f"  datalog   = seq {old}..{new} "
+              f"({max(0, new - old + 1) if new else 0} registros)")
+        print(f"  uptime    = {upm // 1440}d {upm % 1440 // 60}h {upm % 60}m"
+              f"   temp chip = {inp[20] - 40}°C")
+        hold9 = bus.read_regs(addr, 0x03, 9, 1)
+        if hold9:
+            print(f"  intervalo = {hold9[0]} min" if hold9[0]
+                  else "  intervalo = datalog apagado")
 
 
 def cmd_set_alarm(bus, addr, lo_mv, hi_mv, hyst):
@@ -270,6 +282,49 @@ def cmd_alarm_clear(bus, addr):
     print(f"OK addr {addr}: latches limpiados, Vmín/Vmáx reiniciados")
 
 
+LOG_REC = struct.Struct("<IIHHHBB")
+
+
+def cmd_log(bus, addr, since):
+    inp = bus.read_regs(addr, 0x04, 14, 6)
+    if inp is None:
+        sys.exit(f"addr {addr}: sin respuesta (¿firmware v2.0+?)")
+    newest = (inp[0] << 16) | inp[1]
+    oldest = (inp[2] << 16) | inp[3]
+    upnow  = (inp[4] << 16) | inp[5]
+    if newest == 0:
+        print("(datalog vacío)")
+        return
+    start = since if since is not None else oldest
+    print(f"registros {start}..{newest}  (uptime actual "
+          f"{upnow // 60}h {upnow % 60}m):")
+    print(f"{'seq':>6} {'hace':>10} {'vmin':>7} {'vavg':>7} {'vmax':>7} "
+          f"{'temp':>5}  flags")
+    now = time.time()
+    cursor = start
+    while cursor <= newest:
+        req = struct.pack(">BBIB", addr, 0x43, cursor, 12)
+        raw = bus.xfer_raw(req, timeout=0.5)
+        if len(raw) < 5 or crc16(raw) != 0 or raw[0] != addr or raw[1] != 0x43:
+            sys.exit(f"error leyendo desde seq {cursor}")
+        n = raw[2]
+        if n == 0:
+            break
+        for i in range(n):
+            seq, upm, vmin, vmax, vavg, flags, temp =                 LOG_REC.unpack(raw[3 + i * 16:3 + (i + 1) * 16])
+            ago_min = upnow - upm
+            ago = (f"{ago_min // 1440}d{ago_min % 1440 // 60:02d}h"
+                   if ago_min >= 1440 else f"{ago_min // 60}h{ago_min % 60:02d}m")
+            fl = []
+            if flags & 1: fl.append("ALARMA-BAJA")
+            if flags & 2: fl.append("ALARMA-ALTA")
+            if flags & 4: fl.append(f"BOOT({fmt_reset(flags >> 4)})")
+            print(f"{seq:>6} {ago:>10} {vmin / 1000:>6.3f}V {vavg / 1000:>6.3f}V "
+                  f"{vmax / 1000:>6.3f}V {temp - 40:>4}°C  {' '.join(fl)}")
+            cursor = seq + 1
+    print(f"({cursor - start} registros leídos)")
+
+
 # ---------- actualización de firmware por el bus (boot485, FC 0x42) ----------
 
 def bl_cmd(bus, sub: int, uid: bytes, payload: bytes = b"",
@@ -287,6 +342,8 @@ def cmd_update(bus, addr, path):
     fw = open(path, "rb").read()
     if len(fw) % 2:
         fw += b"\xff"
+    if len(fw) > 0x7FF0:
+        sys.exit(f"binario de {len(fw)}B excede la zona de app (32K-16)")
     crc = zlib.crc32(fw) & 0xFFFFFFFF
     print(f"Firmware: {len(fw)} bytes, CRC32 {crc:08X}")
 
@@ -332,7 +389,7 @@ def cmd_update(bus, addr, path):
     print(" ok")
 
     trailer = struct.pack("<III", 0xA5B007A5, len(fw), crc) + b"\xff" * 4
-    payload = struct.pack(">IB", 0xCFF0, 16) + trailer
+    payload = struct.pack(">IB", 0x7FF0, 16) + trailer
     for retry in range(3):
         if bl_cmd(bus, 0x02, uid, payload) is not None:
             break
@@ -491,6 +548,16 @@ def main():
     s.add_argument("addr", type=int)
     s.add_argument("file", help="binario de la app (modbus_vbat.bin)")
 
+    s = sub.add_parser("log", help="lee el datalogger de la tarjeta (v2.0+)")
+    s.add_argument("addr", type=int)
+    s.add_argument("--since", type=int, default=None,
+                   help="desde esta seq (def. todo)")
+
+    s = sub.add_parser("set-log-interval",
+                       help="intervalo del datalogger en minutos (0=off)")
+    s.add_argument("addr", type=int)
+    s.add_argument("minutes", type=int)
+
     a = ap.parse_args()
     bus = Bus(a.port)
 
@@ -518,6 +585,14 @@ def main():
         cmd_alarm_clear(bus, a.addr)
     elif a.cmd == "update":
         cmd_update(bus, a.addr, a.file)
+    elif a.cmd == "log":
+        cmd_log(bus, a.addr, a.since)
+    elif a.cmd == "set-log-interval":
+        if not bus.write_reg(a.addr, 9, a.minutes):
+            sys.exit("falló la escritura del intervalo")
+        if not bus.save_cfg(a.addr):
+            sys.exit("falló el guardado")
+        print(f"OK: intervalo datalog = {a.minutes} min (persistido)")
 
 
 if __name__ == "__main__":

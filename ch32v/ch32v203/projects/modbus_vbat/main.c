@@ -20,6 +20,9 @@
  *        bit2=BAJA ocurrió (latch), bit3=ALTA ocurrió (latch)
  *     12 Vmín en mV desde el último clear
  *     13 Vmáx en mV desde el último clear
+ *     14/15 seq más nueva del datalog (hi/lo), 16/17 seq más vieja
+ *     18/19 uptime en minutos (hi/lo)
+ *     20 temperatura interna del chip (°C + 40)
  *
  *   Holding registers (FC 0x03 / 0x06 / 0x10):
  *     0  dirección esclavo (1-247)
@@ -33,6 +36,15 @@
  *     7  escribir 1 = limpiar latches de alarma y reiniciar Vmín/Vmáx
  *     8  escribir 0xB007 = reiniciar en modo BOOTLOADER (actualización
  *        de firmware por RS-485; ver projects/boot485)
+ *     9  intervalo del datalogger en minutos (0=apagado, máx 1440)
+ *
+ * DATALOGGER (mapa flash v2: app 32K en 0x2000, datos 20K en 0xA000):
+ *   Registro de 16B cada intervalo: seq, uptime_min, vmin/vmax/vavg
+ *   del intervalo, flags (alarmas del intervalo, boot, causa reset),
+ *   temperatura. Anillo de 5 páginas = 1280 registros (~9 días a 10min).
+ *   SOBREVIVE actualizaciones OTA (el bootloader v1.2 no toca 0xA000+).
+ *   Lectura: FC usuario 0x43: [addr][43][seq_desde u32][max u8][crc] →
+ *   [addr][43][n][n×16B][crc] con registros en orden de seq (máx 12).
  *
  * ALARMAS: evaluadas EN LA TARJETA sobre el muestreo continuo de fondo
  * (~15 promedios/s), sin depender del maestro. Con histéresis para no
@@ -64,7 +76,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION   0x010A
+#define FW_VERSION   0x0200
 #define HANG_KEY     0xDEADu
 #define BOOT_KEY     0xB007u
 #define DEFAULT_HYST 200u
@@ -89,12 +101,23 @@
 #define ADC_SAMPLES  16u
 
 #define CFG_ADDR     0x0800F000u          /* última página de 4K */
-#define CFG_MAGIC    0xB008u              /* v1.5: struct con alarmas */
+#define CFG_MAGIC    0xB009u              /* v2.0: + intervalo datalog */
 #define DEFAULT_ADDR 247u
 #define DEFAULT_CAL  10000u
 #define SAVE_KEY     0xA55Au
 
 #define UID_BASE     0x1FFFF7E8u          /* ESIG: UID 96 bits */
+
+/* datalogger */
+#define FC_LOG       0x43
+#define LOG_BASE     0x0800A000u
+#define LOG_PAGES    5u
+#define LOG_PAGE_SZ  4096u
+#define LOG_REC_SZ   16u
+#define LOG_RECS     (LOG_PAGES * LOG_PAGE_SZ / LOG_REC_SZ)   /* 1280 */
+#define LOG_EMPTY1   0xE339E339u          /* flash WCH borrada */
+#define LOG_EMPTY2   0xFFFFFFFFu
+#define DEFAULT_LOGMIN 10u
 
 /* Fin de frame RTU: silencio de 4 ms (3.5 chars @115200 son 0.3 ms,
  * pero los maestros USB-RS485 meten huecos de ~1-2 ms entre bytes) */
@@ -107,6 +130,7 @@ typedef struct {
     uint16_t alarm_lo;                    /* mV, 0 = deshabilitada */
     uint16_t alarm_hi;                    /* mV, 0 = deshabilitada */
     uint16_t hyst;                        /* mV */
+    uint16_t log_min;                     /* intervalo datalog en minutos */
     uint16_t check;                       /* xor de todo lo anterior */
 } cfg_t;
 
@@ -125,6 +149,29 @@ static uint16_t g_vbat_mv;                /* calibrado, cache */
 static uint16_t g_vmin_mv = 0xFFFF;
 static uint16_t g_vmax_mv = 0;
 static uint16_t g_alarm;                  /* bits, ver input reg 11 */
+
+/* datalogger */
+typedef struct {
+    uint32_t seq;
+    uint32_t uptime_min;
+    uint16_t vmin, vmax, vavg;
+    uint8_t  flags;   /* b0=alarma baja en intervalo, b1=alta, b2=boot,
+                         b4-7=causa reset (solo registro de boot) */
+    uint8_t  temp;    /* °C + 40 */
+} log_rec_t;
+
+static uint16_t g_log_min = DEFAULT_LOGMIN;
+static uint32_t g_log_seq;                /* próxima seq a escribir */
+static uint32_t g_log_wpos;               /* próximo índice 0..1279 */
+static uint32_t g_uptime_min;
+static uint8_t  g_temp;                   /* °C+40, refrescada por intervalo */
+static uint8_t  g_boot_pending = 1;       /* primer registro tras reset */
+
+/* acumuladores del intervalo en curso */
+static uint32_t g_iv_sum, g_iv_n;
+static uint16_t g_iv_min = 0xFFFF, g_iv_max;
+static uint8_t  g_iv_alarm;
+static uint32_t g_iv_start_min;
 
 /* ---------- watchdog ---------- */
 
@@ -155,7 +202,7 @@ static void reset_cause_init(void)
 static uint16_t cfg_check(const cfg_t *c)
 {
     return (uint16_t)(c->magic ^ c->addr ^ c->cal ^
-                      c->alarm_lo ^ c->alarm_hi ^ c->hyst);
+                      c->alarm_lo ^ c->alarm_hi ^ c->hyst ^ c->log_min);
 }
 
 static void cfg_load(void)
@@ -164,12 +211,14 @@ static void cfg_load(void)
 
     if (c->magic == CFG_MAGIC && c->check == cfg_check(c) &&
         c->addr >= 1 && c->addr <= 247 &&
-        c->cal >= 5000 && c->cal <= 20000 && c->hyst <= 2000) {
+        c->cal >= 5000 && c->cal <= 20000 && c->hyst <= 2000 &&
+        c->log_min <= 1440) {
         g_addr     = c->addr;
         g_cal      = c->cal;
         g_alarm_lo = c->alarm_lo;
         g_alarm_hi = c->alarm_hi;
         g_hyst     = c->hyst;
+        g_log_min  = c->log_min;
     }
 }
 
@@ -182,6 +231,7 @@ static int cfg_save(void)
         .alarm_lo = g_alarm_lo,
         .alarm_hi = g_alarm_hi,
         .hyst     = g_hyst,
+        .log_min  = g_log_min,
     };
     c.check = cfg_check(&c);
     const uint16_t *src = (const uint16_t *)&c;
@@ -330,6 +380,7 @@ static void adc_init(void)
     adc.ADC_NbrOfChannel       = 1;
     ADC_Init(ADC1, &adc);
 
+    ADC_TempSensorVrefintCmd(ENABLE);
     ADC_Cmd(ADC1, ENABLE);
 
     ADC_ResetCalibration(ADC1);
@@ -352,6 +403,25 @@ static uint16_t adc_sample_once(void)
     return ADC_GetConversionValue(ADC1);
 }
 
+static uint8_t temp_read(void)
+{
+    uint32_t acc = 0;
+
+    for (int i = 0; i < 4; i++) {
+        ADC_RegularChannelConfig(ADC1, ADC_Channel_TempSensor, 1,
+                                 ADC_SampleTime_239Cycles5);
+        ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+        while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET)
+            ;
+        acc += ADC_GetConversionValue(ADC1);
+    }
+    int32_t mv = (int32_t)(acc / 4) * VREF_MV / 4095;
+    int32_t c  = TempSensor_Volt_To_Temper(mv) + 40;
+    if (c < 0) c = 0;
+    if (c > 255) c = 255;
+    return (uint8_t)c;
+}
+
 /* nuevo promedio de fondo listo: refrescar cache, min/max y alarmas */
 static void measurement_update(uint16_t raw)
 {
@@ -365,6 +435,12 @@ static void measurement_update(uint16_t raw)
     if (g_vbat_mv > g_vmax_mv)
         g_vmax_mv = g_vbat_mv;
 
+    g_iv_sum += g_vbat_mv;
+    g_iv_n++;
+    if (g_vbat_mv < g_iv_min) g_iv_min = g_vbat_mv;
+    if (g_vbat_mv > g_iv_max) g_iv_max = g_vbat_mv;
+
+    g_iv_alarm |= (uint8_t)(g_alarm & 0x03);
     if (g_alarm_lo) {
         if (g_vbat_mv < g_alarm_lo)
             g_alarm |= 0x01 | 0x04;       /* activa + latch */
@@ -381,6 +457,124 @@ static void measurement_update(uint16_t raw)
     } else {
         g_alarm &= ~0x02u;
     }
+}
+
+/* ---------- datalogger ---------- */
+
+static const log_rec_t *log_cell(uint32_t idx)
+{
+    return (const log_rec_t *)(LOG_BASE + idx * LOG_REC_SZ);
+}
+
+static int log_cell_valid(uint32_t idx)
+{
+    uint32_t s = log_cell(idx)->seq;
+    return s != LOG_EMPTY1 && s != LOG_EMPTY2 && s != 0;
+}
+
+/* al arrancar: encontrar la seq máxima y posicionar la escritura */
+static void log_scan(void)
+{
+    uint32_t max_seq = 0, max_idx = 0;
+
+    for (uint32_t i = 0; i < LOG_RECS; i++) {
+        if (log_cell_valid(i) && log_cell(i)->seq > max_seq) {
+            max_seq = log_cell(i)->seq;
+            max_idx = i;
+        }
+    }
+    g_log_seq  = max_seq + 1;
+    g_log_wpos = max_seq ? (max_idx + 1) % LOG_RECS : 0;
+}
+
+static uint32_t log_oldest_seq(void)
+{
+    uint32_t min_seq = 0xFFFFFFFEu;
+    int      any = 0;
+
+    for (uint32_t i = 0; i < LOG_RECS; i++)
+        if (log_cell_valid(i) && log_cell(i)->seq < min_seq) {
+            min_seq = log_cell(i)->seq;
+            any = 1;
+        }
+    return any ? min_seq : 0;
+}
+
+/* escribir un registro con verificación y auto-reparación de celda */
+static void log_append(const log_rec_t *rec)
+{
+    for (int attempt = 0; attempt < 4; attempt++) {
+        uint32_t idx  = g_log_wpos;
+        uint32_t addr = LOG_BASE + idx * LOG_REC_SZ;
+
+        FLASH_Unlock();
+        if (idx % (LOG_PAGE_SZ / LOG_REC_SZ) == 0)
+            FLASH_ErasePage(addr);        /* entrar a página: reciclar */
+        const uint16_t *src = (const uint16_t *)rec;
+        for (uint32_t i = 0; i < LOG_REC_SZ / 2; i++)
+            FLASH_ProgramHalfWord(addr + i * 2, src[i]);
+        FLASH_Lock();
+
+        g_log_wpos = (idx + 1) % LOG_RECS;
+        if (!memcmp((const void *)addr, rec, LOG_REC_SZ)) {
+            g_log_seq++;
+            return;                       /* verificado */
+        }
+        /* celda mala o escritura corrupta: probar la siguiente */
+    }
+    g_log_seq++;                          /* rendirse con este registro */
+}
+
+/* cierre de intervalo: construir y persistir el registro */
+static void log_flush_interval(void)
+{
+    log_rec_t r;
+
+    if (g_iv_n == 0)
+        return;
+    r.seq        = g_log_seq;
+    r.uptime_min = g_uptime_min;
+    r.vmin       = g_iv_min;
+    r.vmax       = g_iv_max;
+    r.vavg       = (uint16_t)(g_iv_sum / g_iv_n);
+    r.flags      = (uint8_t)(g_iv_alarm & 0x03);
+    if (g_boot_pending) {
+        r.flags |= 0x04 | (uint8_t)((g_reset_cause & 0x0F) << 4);
+        g_boot_pending = 0;
+    }
+    r.temp = g_temp;
+    log_append(&r);
+
+    g_iv_sum = 0; g_iv_n = 0;
+    g_iv_min = 0xFFFF; g_iv_max = 0;
+    g_iv_alarm = 0;
+    g_iv_start_min = g_uptime_min;
+}
+
+/* respuesta a FC 0x43: registros desde seq_desde, en orden */
+static uint32_t log_read(uint32_t from_seq, uint8_t max, uint8_t *out)
+{
+    uint32_t n = 0, cursor = from_seq;
+
+    while (n < max) {
+        uint32_t best_seq = 0xFFFFFFFFu, best_idx = 0;
+        int      found = 0;
+
+        for (uint32_t i = 0; i < LOG_RECS; i++)
+            if (log_cell_valid(i) && log_cell(i)->seq >= cursor &&
+                log_cell(i)->seq < best_seq) {
+                best_seq = log_cell(i)->seq;
+                best_idx = i;
+                found = 1;
+            }
+        if (!found)
+            break;
+        memcpy(out + n * LOG_REC_SZ, (const void *)log_cell(best_idx),
+               LOG_REC_SZ);
+        cursor = best_seq + 1;
+        n++;
+    }
+    return n;
 }
 
 /* ---------- Modbus RTU ---------- */
@@ -412,6 +606,13 @@ static uint16_t input_reg(uint16_t idx)
     case 11: return g_alarm;
     case 12: return g_vmin_mv;
     case 13: return g_vmax_mv;
+    case 14: return (uint16_t)((g_log_seq - 1) >> 16);
+    case 15: return (uint16_t)(g_log_seq - 1);
+    case 16: return (uint16_t)(log_oldest_seq() >> 16);
+    case 17: return (uint16_t)log_oldest_seq();
+    case 18: return (uint16_t)(g_uptime_min >> 16);
+    case 19: return (uint16_t)g_uptime_min;
+    case 20: return g_temp;
     default: return 0;
     }
 }
@@ -424,6 +625,7 @@ static uint16_t holding_read(uint16_t idx)
     case 4: return g_alarm_lo;
     case 5: return g_alarm_hi;
     case 6: return g_hyst;
+    case 9: return g_log_min;
     default: return 0;                    /* claves se leen como 0 */
     }
 }
@@ -473,6 +675,11 @@ static uint8_t holding_write(uint16_t idx, uint16_t val)
         if (val != BOOT_KEY)
             return 3;
         g_boot_request = 1;               /* reinicia tras responder */
+        return 0;
+    case 9:
+        if (val > 1440)
+            return 3;
+        g_log_min = val;
         return 0;
     default:
         return 2;                         /* illegal data address */
@@ -576,10 +783,30 @@ static int mb_handle(const uint8_t *f, uint32_t len)
     if (!bcast && g_addr == DEFAULT_ADDR)
         return 0;                     /* sin configurar: solo discovery/bcast */
 
+    if (fc == FC_LOG && !bcast) {     /* leer datalog desde una seq */
+        static uint8_t lresp[6 + 12 * LOG_REC_SZ];
+
+        if (len != 9)
+            return 1;                 /* silencio: frame malformado */
+        uint32_t from = ((uint32_t)f[2] << 24) | ((uint32_t)f[3] << 16) |
+                        ((uint32_t)f[4] << 8) | f[5];
+        uint8_t  maxn = f[6] > 12 ? 12 : f[6];
+        uint32_t n    = log_read(from, maxn, &lresp[3]);
+
+        lresp[0] = addr;
+        lresp[1] = FC_LOG;
+        lresp[2] = (uint8_t)n;
+        uint16_t crc = crc16(lresp, 3 + n * LOG_REC_SZ);
+        lresp[3 + n * LOG_REC_SZ] = crc & 0xFF;
+        lresp[4 + n * LOG_REC_SZ] = crc >> 8;
+        rs485_send(lresp, 5 + n * LOG_REC_SZ);
+        return 1;
+    }
+
     if ((fc == 0x03 || fc == 0x04) && len == 8 && !bcast) {
         uint16_t start = (f[2] << 8) | f[3];
         uint16_t count = (f[4] << 8) | f[5];
-        uint16_t nregs = (fc == 0x04) ? 14 : 8;
+        uint16_t nregs = (fc == 0x04) ? 21 : 10;
 
         if (count < 1 || count > 32 || start + count > nregs) {
             mb_exception(addr, fc, 2);
@@ -680,6 +907,8 @@ int main(void)
         g_vmin_mv = g_vbat_mv;
         g_vmax_mv = g_vbat_mv;
     }
+    g_temp = temp_read();
+    log_scan();                           /* posicionar el anillo */
 
     {
         const uint16_t *uid = (const uint16_t *)UID_BASE;
@@ -704,6 +933,14 @@ int main(void)
             if (++tick >= 20) {           /* ~1 ms de reloj para el LED */
                 tick = 0;
                 ms++;
+                if (ms % 60000u == 0) {   /* minutero del datalog */
+                    g_uptime_min++;
+                    if (g_log_min &&
+                        g_uptime_min - g_iv_start_min >= g_log_min) {
+                        g_temp = temp_read();
+                        log_flush_interval();
+                    }
+                }
             }
             IWDG_ReloadCounter();         /* alimentar el perro */
 

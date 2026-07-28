@@ -2,9 +2,11 @@
  * boot485 — Bootloader RS-485 para buck_adc (CH32V203C8T6)
  *
  * Vive en las primeras 2 páginas de flash (0x0000-0x1FFF, 8K) y es
- * INMUTABLE: jamás se borra a sí mismo. Instala aplicaciones en la
- * zona 0x2000-0xEFFF (52K-16) recibidas por el bus RS-485. La página
- * de configuración (0xF000) no se toca: sobrevive actualizaciones.
+ * INMUTABLE: jamás se borra a sí mismo. Mapa de flash v2:
+ *   0x2000-0x9FFF  app (32K, trailer de validez en 0x9FF0) — zona OTA
+ *   0xA000-0xEFFF  datalogger (20K, 5 páginas) — SOBREVIVE OTA
+ *   0xF000         configuración — SOBREVIVE OTA
+ * Solo la zona de app se borra al actualizar.
  *
  * Arranque:
  *   1. ¿Bandera "BOOT" en RAM (0x20004FF0, puesta por la app)? → quedarse
@@ -27,7 +29,7 @@
 #include "ch32v20x.h"
 #include <string.h>
 
-#define BL_VERSION   0x0101
+#define BL_VERSION   0x0102
 #define FC_BOOT      0x42
 #define BL_ID        0xF8u                /* byte de dirección en respuestas */
 
@@ -36,8 +38,8 @@
                                              coincidir con las direcciones de
                                              enlace de la app (la/auipc son
                                              relativas al PC) */
-#define APP_MAX      0xCFF0u              /* 52K - 16 de trailer */
-#define TRAILER_ADDR 0x0800EFF0u
+#define APP_MAX      0x7FF0u              /* 32K - 16 de trailer */
+#define TRAILER_ADDR 0x08009FF0u
 #define TRAILER_MAGIC 0xA5B007A5u
 
 #define BOOT_FLAG_ADDR  0x20004FF0u
@@ -217,7 +219,7 @@ static int bl_handle(const uint8_t *f, uint32_t len)
 
     } else if (sub == 0x01 && len == 17) { /* ERASE zona app */
         FLASH_Unlock();
-        for (uint32_t a = APP_BASE; a < 0x0800F000u; a += 4096) {
+        for (uint32_t a = APP_BASE; a < 0x0800A000u; a += 4096) {
             if (FLASH_ErasePage(a) != FLASH_COMPLETE) {
                 FLASH_Lock();
                 bl_error(sub, 4);
