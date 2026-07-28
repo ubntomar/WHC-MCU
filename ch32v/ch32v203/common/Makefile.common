@@ -29,7 +29,11 @@ CFLAGS  += $(ARCH) -Os -g -Wall \
            -nostartfiles \
            $(INCLUDES)
 
-LDFLAGS += $(ARCH) -T $(SDK)/Ld/Link.ld \
+# Linker script por defecto; un proyecto puede definir LDSCRIPT antes
+# del include (p.ej. para apps que conviven con bootloader)
+LDSCRIPT ?= $(SDK)/Ld/Link.ld
+
+LDFLAGS += $(ARCH) -T $(LDSCRIPT) \
            -nostartfiles -Wl,--gc-sections \
            -Wl,-Map=$(BUILD)/$(TARGET).map \
            --specs=nano.specs --specs=nosys.specs
@@ -48,7 +52,7 @@ SDK_SRCS_C = \
 # (p.ej. SDK_EXTRA_C = $(SDK)/Peripheral/src/ch32v20x_adc.c)
 SDK_SRCS_C += $(SDK_EXTRA_C)
 
-SDK_SRCS_S = $(SDK)/Startup/startup_ch32v20x_D6.S
+SDK_SRCS_S ?= $(SDK)/Startup/startup_ch32v20x_D6.S
 
 BUILD   ?= build
 

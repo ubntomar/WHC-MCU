@@ -270,6 +270,95 @@ def cmd_alarm_clear(bus, addr):
     print(f"OK addr {addr}: latches limpiados, Vmín/Vmáx reiniciados")
 
 
+# ---------- actualización de firmware por el bus (boot485, FC 0x42) ----------
+
+def bl_cmd(bus, sub: int, uid: bytes, payload: bytes = b"",
+           timeout: float = 0.4):
+    """Comando al bootloader; devuelve el payload de la respuesta o None."""
+    raw = bus.xfer_raw(bytes([0, 0x42, sub]) + uid + payload, timeout)
+    if (len(raw) >= 17 and crc16(raw) == 0 and raw[0] == 0xF8 and
+            raw[1] == 0x42 and raw[2] == sub and raw[3:15] == uid):
+        return raw[15:-2]
+    return None
+
+
+def cmd_update(bus, addr, path):
+    import zlib
+    fw = open(path, "rb").read()
+    if len(fw) % 2:
+        fw += b"\xff"
+    crc = zlib.crc32(fw) & 0xFFFFFFFF
+    print(f"Firmware: {len(fw)} bytes, CRC32 {crc:08X}")
+
+    regs = bus.read_regs(addr, 0x04, 3, 7)
+    if regs is None:
+        sys.exit(f"addr {addr}: sin respuesta (¿tarjeta apagada?)")
+    ver, uid = regs[0], struct.pack("<6H", *regs[1:7])
+    print(f"Tarjeta addr {addr}: firmware v{ver >> 8}.{ver & 0xFF}, "
+          f"UID {fmt_uid_bytes(uid)}")
+
+    print("Reiniciando en modo bootloader...")
+    bus.write_reg(addr, 8, 0xB007)
+    time.sleep(0.2)
+
+    for _ in range(25):
+        r = bl_cmd(bus, 0x00, uid, timeout=0.2)
+        if r is not None:
+            blver = (r[0] << 8) | r[1]
+            print(f"Bootloader v{blver >> 8}.{blver & 0xFF} respondiendo "
+                  f"(app previa {'válida' if r[2] else 'inválida'})")
+            break
+        time.sleep(0.1)
+    else:
+        sys.exit("el bootloader no respondió — apagá/encendé y reintentá "
+                 "(la app anterior sigue intacta)")
+
+    print("Borrando zona de aplicación...")
+    if bl_cmd(bus, 0x01, uid, timeout=3.0) is None:
+        sys.exit("falló el borrado")
+
+    print(f"Enviando {(len(fw) + 63) // 64} bloques", end="", flush=True)
+    for off in range(0, len(fw), 64):
+        chunk = fw[off:off + 64]
+        payload = struct.pack(">IB", off, len(chunk)) + chunk
+        for retry in range(3):
+            r = bl_cmd(bus, 0x02, uid, payload)
+            if r is not None:
+                break
+        else:
+            sys.exit(f"\nfalló la escritura en offset {off} tras 3 intentos")
+        if (off // 64) % 20 == 0:
+            print(".", end="", flush=True)
+    print(" ok")
+
+    trailer = struct.pack("<III", 0xA5B007A5, len(fw), crc) + b"\xff" * 4
+    payload = struct.pack(">IB", 0xCFF0, 16) + trailer
+    for retry in range(3):
+        if bl_cmd(bus, 0x02, uid, payload) is not None:
+            break
+    else:
+        sys.exit("falló la escritura del trailer")
+
+    print("Verificando CRC y activando...")
+    if bl_cmd(bus, 0x03, uid, struct.pack(">II", len(fw), crc),
+              timeout=2.0) is None:
+        sys.exit("el CRC no cuadró — la app NO fue activada; reintentá")
+
+    print("Reiniciando a la aplicación nueva...")
+    bl_cmd(bus, 0x04, uid, timeout=0.3)
+    time.sleep(0.8)
+
+    for _ in range(10):
+        regs = bus.read_regs(addr, 0x04, 0, 4)
+        if regs is not None:
+            print(f"¡Actualizada! addr {addr} viva con firmware "
+                  f"v{regs[3] >> 8}.{regs[3] & 0xFF}, "
+                  f"VBAT={regs[0] / 1000:.3f}V (config preservada)")
+            return
+        time.sleep(0.3)
+    sys.exit("la app nueva no respondió — revisar (¿dirección cambió?)")
+
+
 def cmd_hang_test(bus, addr):
     print(f"Enviando cuelgue intencional a addr {addr}...")
     if not bus.write_reg(addr, 3, 0xDEAD):
@@ -397,6 +486,11 @@ def main():
                        help="limpia latches y reinicia Vmín/Vmáx")
     s.add_argument("addr", type=int)
 
+    s = sub.add_parser("update",
+                       help="actualiza el firmware por RS-485 (boot485)")
+    s.add_argument("addr", type=int)
+    s.add_argument("file", help="binario de la app (modbus_vbat.bin)")
+
     a = ap.parse_args()
     bus = Bus(a.port)
 
@@ -422,6 +516,8 @@ def main():
         cmd_set_alarm(bus, a.addr, a.lo_mv, a.hi_mv, a.hyst)
     elif a.cmd == "alarm-clear":
         cmd_alarm_clear(bus, a.addr)
+    elif a.cmd == "update":
+        cmd_update(bus, a.addr, a.file)
 
 
 if __name__ == "__main__":

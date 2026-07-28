@@ -31,6 +31,8 @@
  *     5  umbral de alarma ALTA en mV (0 = deshabilitada)
  *     6  histéresis en mV (def. 200, máx. 2000)
  *     7  escribir 1 = limpiar latches de alarma y reiniciar Vmín/Vmáx
+ *     8  escribir 0xB007 = reiniciar en modo BOOTLOADER (actualización
+ *        de firmware por RS-485; ver projects/boot485)
  *
  * ALARMAS: evaluadas EN LA TARJETA sobre el muestreo continuo de fondo
  * (~15 promedios/s), sin depender del maestro. Con histéresis para no
@@ -62,9 +64,14 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION   0x0105
+#define FW_VERSION   0x010A
 #define HANG_KEY     0xDEADu
+#define BOOT_KEY     0xB007u
 #define DEFAULT_HYST 200u
+
+/* bandera en RAM para que boot485 se quede en modo actualización */
+#define BOOT_FLAG_ADDR  0x20004FF0u
+#define BOOT_FLAG_MAGIC 0x424F4F54u       /* "BOOT" */
 #define FC_DISCOVERY 0x41
 
 /*
@@ -110,6 +117,7 @@ static uint16_t g_alarm_hi = 0;
 static uint16_t g_hyst     = DEFAULT_HYST;
 static uint16_t g_reset_cause;            /* bitfield, ver input reg 10 */
 static uint8_t  g_hang_request;           /* prueba de watchdog pedida */
+static uint8_t  g_boot_request;           /* reinicio a bootloader pedido */
 
 /* medición de fondo y alarmas */
 static uint16_t g_raw;                    /* último promedio de 32 */
@@ -461,6 +469,11 @@ static uint8_t holding_write(uint16_t idx, uint16_t val)
         g_vmin_mv = g_vbat_mv;            /* reiniciar min/max */
         g_vmax_mv = g_vbat_mv;
         return 0;
+    case 8:
+        if (val != BOOT_KEY)
+            return 3;
+        g_boot_request = 1;               /* reinicia tras responder */
+        return 0;
     default:
         return 2;                         /* illegal data address */
     }
@@ -718,6 +731,13 @@ int main(void)
                     GPIO_SetBits(GPIOA, GPIO_Pin_1);
                     while (1)
                         ;                  /* sin alimentar el perro */
+                }
+
+                if (g_boot_request) {      /* saltar al bootloader */
+                    dbg_puts("[boot] reiniciando en bootloader RS-485\r\n");
+                    *(volatile uint32_t *)BOOT_FLAG_ADDR = BOOT_FLAG_MAGIC;
+                    Delay_Ms(5);           /* que el eco salga del cable */
+                    NVIC_SystemReset();
                 }
 
                 if (g_addr != old_addr || g_cal != old_cal) {
