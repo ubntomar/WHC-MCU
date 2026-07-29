@@ -477,10 +477,11 @@ def cmd_set_cal(bus, addr, real_mv):
         sys.exit("falló la escritura de calibración")
     if not bus.save_cfg(addr):
         sys.exit("falló el guardado en flash")
-    check = bus.read_regs(addr, 0x04, 0, 1)
+    check = bus.read_regs(addr, 0x04, 0, 1) or bus.read_regs(addr, 0x04, 0, 1)
     print(f"OK: cal {cal_old} → {cal_new} (persistido)")
+    now = f"{check[0] / 1000:.3f}V" if check else "(verificar con read)"
     print(f"    reportaba {reported / 1000:.3f}V, real {real_mv / 1000:.3f}V, "
-          f"ahora lee {check[0] / 1000:.3f}V")
+          f"ahora lee {now}")
 
 
 def cmd_set_cal_raw(bus, addr, factor):
