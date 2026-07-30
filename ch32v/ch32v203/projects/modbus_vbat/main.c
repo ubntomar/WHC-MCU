@@ -76,7 +76,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION   0x0200
+#define FW_VERSION   0x0201
 #define HANG_KEY     0xDEADu
 #define BOOT_KEY     0xB007u
 #define DEFAULT_HYST 200u
@@ -91,6 +91,8 @@
  *   Sin configurar (addr 247): parpadeo rápido continuo 5 Hz
  *   Configurada en espera:     latido corto (40 ms) cada 2 s
  *   Transacción atendida:      flash de 40 ms (sondeo activo = ritmo)
+ *   ALARMA BAJA voltaje:       2 destellos LARGOS por segundo
+ *   ALARMA ALTA voltaje:       ráfaga frenética de 5 destellos/segundo
  */
 #define DE_PORT      GPIOB
 #define DE_PIN       GPIO_Pin_12
@@ -993,8 +995,10 @@ int main(void)
                 on = 1;                            /* transacción */
             else if (g_addr == DEFAULT_ADDR)
                 on = (ms % 200) < 100;             /* sin configurar: 5 Hz */
-            else if (g_alarm & 0x03)
-                on = (t < 60) || (t >= 150 && t < 210);  /* ALARMA: doble */
+            else if (g_alarm & 0x02)      /* ALTA: ráfaga de 5, frenética */
+                on = (t < 600) && ((t % 120) < 60);
+            else if (g_alarm & 0x01)      /* BAJA: 2 destellos largos */
+                on = (t < 180) || (t >= 300 && t < 480);
             else
                 on = (ms % 2000) < 40;             /* latido cada 2 s */
             GPIO_WriteBit(GPIOA, GPIO_Pin_1, on ? Bit_SET : Bit_RESET);

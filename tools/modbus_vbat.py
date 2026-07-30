@@ -112,6 +112,21 @@ def fmt_uid_bytes(uid12: bytes) -> str:
     return "".join(f"{w:04X}" for w in reversed(words))
 
 
+def extract_frame(buf: bytes, addr: int, fc: int):
+    """Busca dentro de buf un frame Modbus válido [addr][fc]...[crc16] y lo
+    devuelve, ignorando bytes ajenos antes o después (algunos dispositivos
+    — EPEVER — responden excepciones a broadcasts y ensucian el bus)."""
+    if len(buf) < 5:
+        return None
+    for start in range(0, len(buf) - 4):
+        if buf[start] != addr or buf[start + 1] != fc:
+            continue
+        for end in range(start + 5, len(buf) + 1):
+            if crc16(buf[start:end]) == 0:
+                return buf[start:end]
+    return None
+
+
 # ---------- auto-descubrimiento (FC usuario 0x41) ----------
 
 def disc_query(bus, nbits: int, prefix: bytes):
@@ -119,17 +134,17 @@ def disc_query(bus, nbits: int, prefix: bytes):
     raw = bus.xfer_raw(bytes([0, 0x41, 0x01, nbits]) + prefix, timeout=0.15)
     if not raw:
         return "silence", None
-    if (len(raw) == 19 and crc16(raw) == 0 and
-            raw[0] == 247 and raw[1] == 0x41 and raw[2] == 0x01):
-        return "clean", raw[3:15]
+    f = extract_frame(raw, 247, 0x41)
+    if f is not None and len(f) == 19 and f[2] == 0x01:
+        return "clean", f[3:15]
     return "collision", None
 
 
 def disc_assign(bus, uid12: bytes, new_addr: int) -> bool:
     req = bytes([0, 0x41, 0x02]) + uid12 + bytes([new_addr])
     raw = bus.xfer_raw(req, timeout=0.4)      # el guardado borra flash
-    return (len(raw) == 17 and crc16(raw) == 0 and
-            raw[0] == new_addr and raw[1] == 0x41 and raw[2] == 0x02)
+    f = extract_frame(raw, new_addr, 0x41)
+    return f is not None and len(f) == 17 and f[2] == 0x02
 
 
 def disc_find_one(bus):
@@ -335,13 +350,22 @@ def bl_cmd(bus, sub: int, uid: bytes, payload: bytes = b"",
            timeout: float = 0.4):
     """Comando al bootloader; devuelve el payload de la respuesta o None."""
     raw = bus.xfer_raw(bytes([0, 0x42, sub]) + uid + payload, timeout)
-    if (len(raw) >= 17 and crc16(raw) == 0 and raw[0] == 0xF8 and
-            raw[1] == 0x42 and raw[2] == sub and raw[3:15] == uid):
-        return raw[15:-2]
+    f = extract_frame(raw, 0xF8, 0x42)
+    if (f is not None and len(f) >= 17 and f[2] == sub and f[3:15] == uid):
+        return f[15:-2]
     return None
 
 
-def cmd_update(bus, addr, path):
+def parse_uid(disp: str) -> bytes:
+    """UID en formato de display (24 hex, words invertidas) → 12 bytes raw."""
+    disp = disp.strip().upper()
+    if len(disp) != 24:
+        sys.exit("UID debe tener 24 caracteres hex")
+    words = [int(disp[i:i + 4], 16) for i in range(0, 24, 4)]
+    return struct.pack("<6H", *reversed(words))
+
+
+def cmd_update(bus, addr, path, uid_hex=None):
     import zlib
     fw = open(path, "rb").read()
     if len(fw) % 2:
@@ -351,16 +375,21 @@ def cmd_update(bus, addr, path):
     crc = zlib.crc32(fw) & 0xFFFFFFFF
     print(f"Firmware: {len(fw)} bytes, CRC32 {crc:08X}")
 
-    regs = bus.read_regs(addr, 0x04, 3, 7)
-    if regs is None:
-        sys.exit(f"addr {addr}: sin respuesta (¿tarjeta apagada?)")
-    ver, uid = regs[0], struct.pack("<6H", *regs[1:7])
-    print(f"Tarjeta addr {addr}: firmware v{ver >> 8}.{ver & 0xFF}, "
-          f"UID {fmt_uid_bytes(uid)}")
+    if uid_hex:
+        uid = parse_uid(uid_hex)
+        print(f"Modo rescate: directo al bootloader, UID {fmt_uid_bytes(uid)}")
+    else:
+        regs = bus.read_regs(addr, 0x04, 3, 7)
+        if regs is None:
+            sys.exit(f"addr {addr}: sin respuesta — si quedó en bootloader "
+                     f"(LED muy rápido), usá: update {addr} fw.bin --uid <UID>")
+        ver, uid = regs[0], struct.pack("<6H", *regs[1:7])
+        print(f"Tarjeta addr {addr}: firmware v{ver >> 8}.{ver & 0xFF}, "
+              f"UID {fmt_uid_bytes(uid)}")
 
-    print("Reiniciando en modo bootloader...")
-    bus.write_reg(addr, 8, 0xB007)
-    time.sleep(0.2)
+        print("Reiniciando en modo bootloader...")
+        bus.write_reg(addr, 8, 0xB007)
+        time.sleep(0.2)
 
     for _ in range(25):
         r = bl_cmd(bus, 0x00, uid, timeout=0.2)
@@ -375,38 +404,46 @@ def cmd_update(bus, addr, path):
                  "(la app anterior sigue intacta)")
 
     print("Borrando zona de aplicación...")
-    if bl_cmd(bus, 0x01, uid, timeout=3.0) is None:
-        sys.exit("falló el borrado")
+    for retry in range(5):
+        if bl_cmd(bus, 0x01, uid, timeout=3.0) is not None:
+            break
+    else:
+        sys.exit("falló el borrado tras 5 intentos")
 
     print(f"Enviando {(len(fw) + 63) // 64} bloques", end="", flush=True)
     for off in range(0, len(fw), 64):
         chunk = fw[off:off + 64]
         payload = struct.pack(">IB", off, len(chunk)) + chunk
-        for retry in range(3):
+        for retry in range(6):
             r = bl_cmd(bus, 0x02, uid, payload)
             if r is not None:
                 break
         else:
-            sys.exit(f"\nfalló la escritura en offset {off} tras 3 intentos")
+            sys.exit(f"\nfalló la escritura en offset {off} tras 6 intentos")
         if (off // 64) % 20 == 0:
             print(".", end="", flush=True)
     print(" ok")
 
     trailer = struct.pack("<III", 0xA5B007A5, len(fw), crc) + b"\xff" * 4
     payload = struct.pack(">IB", 0x7FF0, 16) + trailer
-    for retry in range(3):
+    for retry in range(6):
         if bl_cmd(bus, 0x02, uid, payload) is not None:
             break
     else:
         sys.exit("falló la escritura del trailer")
 
     print("Verificando CRC y activando...")
-    if bl_cmd(bus, 0x03, uid, struct.pack(">II", len(fw), crc),
-              timeout=2.0) is None:
-        sys.exit("el CRC no cuadró — la app NO fue activada; reintentá")
+    for retry in range(4):
+        if bl_cmd(bus, 0x03, uid, struct.pack(">II", len(fw), crc),
+                  timeout=2.0) is not None:
+            break
+    else:
+        sys.exit("el CRC no cuadró tras 4 intentos — app NO activada; reintentá")
 
     print("Reiniciando a la aplicación nueva...")
-    bl_cmd(bus, 0x04, uid, timeout=0.3)
+    for retry in range(3):
+        if bl_cmd(bus, 0x04, uid, timeout=0.4) is not None:
+            break
     time.sleep(0.8)
 
     for _ in range(10):
@@ -552,6 +589,8 @@ def main():
                        help="actualiza el firmware por RS-485 (boot485)")
     s.add_argument("addr", type=int)
     s.add_argument("file", help="binario de la app (modbus_vbat.bin)")
+    s.add_argument("--uid", default=None,
+                   help="rescate: UID (24 hex) de tarjeta ya en bootloader")
 
     s = sub.add_parser("log", help="lee el datalogger de la tarjeta (v2.0+)")
     s.add_argument("addr", type=int)
@@ -589,7 +628,7 @@ def main():
     elif a.cmd == "alarm-clear":
         cmd_alarm_clear(bus, a.addr)
     elif a.cmd == "update":
-        cmd_update(bus, a.addr, a.file)
+        cmd_update(bus, a.addr, a.file, a.uid)
     elif a.cmd == "log":
         cmd_log(bus, a.addr, a.since)
     elif a.cmd == "set-log-interval":
