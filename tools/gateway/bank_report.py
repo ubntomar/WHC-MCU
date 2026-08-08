@@ -40,6 +40,11 @@ def main():
     dias = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     con = sqlite3.connect(DB)
 
+    # los registros anteriores a la primera ancla tienen hora reconstruida:
+    # se marcan con * y no entran en los promedios
+    r = con.execute("SELECT MIN(ts) FROM anchors").fetchone()
+    desde_fiable = local_date(r[0]) if r and r[0] else None
+
     fechas = sorted({local_date(r[0]) for r in con.execute(
         "SELECT ts FROM samples")}, reverse=True)[:dias]
     if not fechas:
@@ -61,27 +66,54 @@ def main():
             (d0, d1)).fetchone()[0]
         celdas = []
         for addr, _ in CARDS:
-            v1 = at_hour(con, addr, day, 1)
+            # ventana profunda 21:00(-1d) → 05:00: ya sin carga superficial
+            v21 = at_hour(con, addr, day - dt.timedelta(days=1), 21)
             v5 = at_hour(con, addr, day, 5)
+            v1 = v21                       # arranque de la ventana
             alba = at_hour(con, addr, day, 6) or v5
             pico = con.execute(
                 "SELECT MAX(vmax) FROM samples WHERE addr=? AND ts BETWEEN ? AND ?",
                 (addr, d0 + 8 * 3600, d0 + 19 * 3600)).fetchone()[0]
+            fiable = desde_fiable is not None and day > desde_fiable
             if v1 and v5:
-                mvh = (v1 - v5) / 4.0
-                caidas[addr].append(mvh)
+                mvh = (v1 - v5) / 8.0
+                if fiable:
+                    caidas[addr].append(mvh)
             else:
                 mvh = None
             celdas.append("%-6s %5s %5s" % (
                 "%.3f" % (alba / 1000) if alba else "  -  ",
                 "%.0f" % mvh if mvh is not None else " - ",
                 "%.2f" % (pico / 1000) if pico else "  -  "))
-        print("%-11s %6s | %s" % (
-            day.isoformat(), "%.2f" % kwh if kwh is not None else "  -  ",
+        marca = "" if (desde_fiable and day > desde_fiable) else "*"
+        print("%-10s%1s %6s | %s" % (
+            day.isoformat(), marca, "%.2f" % kwh if kwh is not None else "  -  ",
             "  ".join(celdas)))
+    if desde_fiable:
+        print("(*) hora reconstruida: no entra en los promedios")
 
     print()
-    print("PROMEDIO DE CAÍDA DE MADRUGADA (test de fuga; menos es mejor):")
+    # reparto de la absorción del último día con datos
+    ult = max(fechas)
+    d0 = dt.datetime.combine(ult, dt.time(0)).timestamp()
+    filas = con.execute(
+        "SELECT ts FROM epever WHERE stage='absorcion' AND ts BETWEEN ? AND ?",
+        (d0, d0 + 86400)).fetchall()
+    if filas:
+        t0, t1 = min(f[0] for f in filas), max(f[0] for f in filas)
+        print("REPARTO EN ABSORCIÓN del %s (%02d:%02d-%02d:%02d) — quién recibe"
+              " el voltaje de carga:" % (ult.isoformat(),
+              dt.datetime.fromtimestamp(t0).hour, dt.datetime.fromtimestamp(t0).minute,
+              dt.datetime.fromtimestamp(t1).hour, dt.datetime.fromtimestamp(t1).minute))
+        for addr, nombre in CARDS:
+            r = con.execute("SELECT AVG(vavg), MAX(vmax) FROM samples WHERE addr=?"
+                            " AND ts BETWEEN ? AND ?", (addr, t0, t1)).fetchone()
+            if r and r[0]:
+                marca = "  <-- se satura primero (limita al banco)" if r[0] > 14300 else ""
+                print("  %-6s promedio %.3f V  pico %.3f V%s" % (
+                    nombre, r[0] / 1000, r[1] / 1000, marca))
+        print()
+    print("CAÍDA EN REPOSO PROFUNDO 21:00-05:00 (test de fuga; menos es mejor):")
     rank = []
     for addr, nombre in CARDS:
         if caidas[addr]:
@@ -95,6 +127,43 @@ def main():
         if mejor > 0 and peor / mejor >= 2:
             print("  → %s fuga %.1f× más rápido que %s" % (
                 max(rank)[1], peor / mejor, min(rank)[1]))
+    # --- vigilancia de las baterías bajo observación ---
+    print()
+    print("VIGILANCIA (últimos 3 días)")
+    desde = (dt.datetime.now() - dt.timedelta(days=3)).timestamp()
+    MIN_POR_REG = 13.7          # duración real medida de un registro
+    for addr, nombre in CARDS:
+        if nombre not in ("150-B", "150-A"):
+            continue
+        alto = con.execute(
+            "SELECT COUNT(*) FROM samples WHERE addr=? AND ts>=? AND vavg>14500",
+            (addr, desde)).fetchone()[0]
+        riesgo = con.execute(
+            "SELECT COUNT(*) FROM samples WHERE addr=? AND ts>=? AND vavg>14800",
+            (addr, desde)).fetchone()[0]
+        pico = con.execute(
+            "SELECT MAX(vmax) FROM samples WHERE addr=? AND ts>=?",
+            (addr, desde)).fetchone()[0]
+        alertas = con.execute(
+            "SELECT tipo, COUNT(*) FROM alerts WHERE addr=? AND ts>=? "
+            "GROUP BY tipo", (addr, desde)).fetchall()
+        print("  %-6s pico %.3f V | %.0f min sobre 14.5 V | %.0f min sobre 14.8 V%s"
+              % (nombre, (pico or 0) / 1000, alto * MIN_POR_REG,
+                 riesgo * MIN_POR_REG,
+                 ("  [" + ", ".join("%s×%d" % (t_, n) for t_, n in alertas) + "]")
+                 if alertas else ""))
+        # tendencia del reposo: ¿está recuperando terreno?
+        albas = []
+        for d in sorted({local_date(r[0]) for r in con.execute(
+                "SELECT ts FROM samples WHERE addr=? AND ts>=?", (addr, desde))}):
+            v = at_hour(con, addr, d, 6)
+            if v:
+                albas.append((d, v))
+        if len(albas) >= 2:
+            delta = albas[-1][1] - albas[0][1]
+            print("         reposo del alba: %s  (%+d mV en %d días)" % (
+                " → ".join("%.3f" % (v / 1000) for _, v in albas),
+                delta, len(albas) - 1))
     con.close()
 
 

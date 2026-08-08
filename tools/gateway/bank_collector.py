@@ -66,6 +66,15 @@ CREATE TABLE IF NOT EXISTS anchors (
     PRIMARY KEY (addr, ts)
 );
 
+-- avisos automáticos (vigilancia de las baterías bajo observación)
+CREATE TABLE IF NOT EXISTS alerts (
+    ts    REAL NOT NULL,
+    addr  INTEGER NOT NULL,
+    tipo  TEXT NOT NULL,
+    valor REAL,
+    PRIMARY KEY (ts, addr, tipo)
+);
+
 CREATE TABLE IF NOT EXISTS live (
     ts   REAL NOT NULL,
     addr INTEGER NOT NULL,
@@ -98,6 +107,29 @@ def get_log(bus, addr, desde, hasta, tope=400):
                 recs.append(LOG_REC.unpack(f[3 + i * 16:3 + (i + 1) * 16]))
             cursor = recs[-1][0] + 1
     return recs
+
+
+# Umbrales de vigilancia (mV). El gel no recombina el gas: por encima de
+# ~14.8 V por batería cada minuto cuenta como desgaste.
+V_ATENCION = 14500
+V_RIESGO   = 14800
+
+
+def revisar(con, addr, filas):
+    """Deja constancia de picos altos y de alarmas de las tarjetas."""
+    for (_a, _seq, ts, _vmin, vmax, vavg, flags, _t, _up) in filas:
+        if vmax >= V_RIESGO:
+            con.execute("INSERT OR IGNORE INTO alerts VALUES (?,?,?,?)",
+                        (ts, addr, "pico_riesgo", vmax / 1000))
+        elif vmax >= V_ATENCION:
+            con.execute("INSERT OR IGNORE INTO alerts VALUES (?,?,?,?)",
+                        (ts, addr, "pico_atencion", vmax / 1000))
+        if flags & 0x01:
+            con.execute("INSERT OR IGNORE INTO alerts VALUES (?,?,?,?)",
+                        (ts, addr, "alarma_baja", vavg / 1000))
+        if flags & 0x02:
+            con.execute("INSERT OR IGNORE INTO alerts VALUES (?,?,?,?)",
+                        (ts, addr, "alarma_alta", vavg / 1000))
 
 
 def collect_card(bus, con, addr, now):
@@ -133,6 +165,7 @@ def collect_card(bus, con, addr, now):
             ts = now - (newest - seq) * 600
         filas.append((addr, seq, ts, vmin, vmax, vavg, flags, temp, uptime))
 
+    revisar(con, addr, filas)
     con.executemany(
         "INSERT OR IGNORE INTO samples "
         "(addr,seq,ts,vmin,vmax,vavg,flags,temp,uptime) "
