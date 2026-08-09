@@ -156,6 +156,8 @@ def main():
         albas = []
         for d in sorted({local_date(r[0]) for r in con.execute(
                 "SELECT ts FROM samples WHERE addr=? AND ts>=?", (addr, desde))}):
+            if desde_fiable and d <= desde_fiable:
+                continue                   # día con hora reconstruida
             v = at_hour(con, addr, d, 6)
             if v:
                 albas.append((d, v))
