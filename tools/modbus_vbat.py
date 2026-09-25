@@ -188,10 +188,26 @@ def disc_find_one(bus):
     return None
 
 
-def cmd_discover(bus, assign: bool, start: int):
+def addr_in_use(bus, addr: int) -> bool:
+    """Ocupada si ALGO responde en esa dirección, incluida una excepción
+    Modbus: el EPEVER (addr 1) contesta 01 84 02 a FC04 reg 0 y antes se
+    tomaba como libre."""
+    if addr in (0, 247) or addr > 246:
+        return True
+    for _ in range(2):
+        raw = bus.xfer_raw(struct.pack(">BBHH", addr, 0x04, 0, 1), 0.3)
+        if extract_frame(raw, addr, 0x04, explen=7) is not None or \
+                extract_frame(raw, addr, 0x84, explen=5) is not None:
+            return True
+    return False
+
+
+def cmd_discover(bus, assign: bool, start: int, limit: int = 0):
+    """limit>0: asignar a lo sumo esa cantidad y parar (identificar por LED:
+    la asignada pasa de 5 Hz al latido cada 2 s)."""
     print("Buscando tarjetas sin configurar (addr 247)...")
     found, next_addr = [], start
-    while True:
+    while not (limit and len(found) >= limit):
         uid = disc_find_one(bus)
         if uid is None:
             break
@@ -201,7 +217,7 @@ def cmd_discover(bus, assign: bool, start: int):
             # sin asignar no sale del pool: una sola pasada informativa
             found.append(uid)
             break
-        while bus.read_regs(next_addr, 0x04, 0, 1) is not None:
+        while addr_in_use(bus, next_addr):
             next_addr += 1                     # dirección ocupada, saltar
         if disc_assign(bus, uid, next_addr):
             check = bus.read_regs(next_addr, 0x04, 0, 1)
@@ -578,6 +594,8 @@ def main():
                    help="asignarles direcciones automáticamente")
     s.add_argument("--start", type=int, default=1,
                    help="primera dirección candidata (def. 1)")
+    s.add_argument("--one", action="store_true",
+                   help="asignar UNA sola tarjeta y parar (marcarla por LED)")
 
     s = sub.add_parser("factory-reset",
                        help="devuelve una tarjeta al estado sin configurar")
@@ -633,7 +651,7 @@ def main():
     elif a.cmd == "set-cal-raw":
         cmd_set_cal_raw(bus, a.addr, a.factor)
     elif a.cmd == "discover":
-        cmd_discover(bus, a.assign, a.start)
+        cmd_discover(bus, a.assign, a.start, 1 if a.one else 0)
     elif a.cmd == "factory-reset":
         cmd_factory_reset(bus, a.addr)
     elif a.cmd == "hang-test":

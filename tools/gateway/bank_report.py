@@ -18,7 +18,7 @@ import sqlite3
 import sys
 
 DB = "/home/orangepi/bank.db"
-CARDS = [(2, "150-B"), (3, "200-N"), (4, "150-A"), (5, "200-V")]
+CARDS = [(8, "150-A"), (9, "200-A"), (10, "200-B"), (11, "150-B"), (7, "UPS")]
 
 
 def local_date(ts):

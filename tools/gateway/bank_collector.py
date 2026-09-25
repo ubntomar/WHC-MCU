@@ -30,11 +30,14 @@ LOCK = "/tmp/bank_collector.lock"
 EPEVER_ADDR = 1
 
 # addr → (etiqueta de la batería, capacidad Ah)
+# Lote rev 2.0 instalado el 2026-09-25 (las rev 1 salieron del banco; su
+# historial sigue en la base bajo las direcciones 2-5).
 CARDS = {
-    2: ("150-B", 150),
-    3: ("200-N", 200),
-    4: ("150-A", 150),
-    5: ("200-V", 200),
+    7:  ("UPS",   0),      # batería de la UPS, fuera del banco
+    8:  ("150-A", 150),
+    9:  ("200-A", 200),
+    10: ("200-B", 200),
+    11: ("150-B", 150),
 }
 
 SCHEMA = """
