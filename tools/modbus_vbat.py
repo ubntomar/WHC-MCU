@@ -112,12 +112,27 @@ def fmt_uid_bytes(uid12: bytes) -> str:
     return "".join(f"{w:04X}" for w in reversed(words))
 
 
-def extract_frame(buf: bytes, addr: int, fc: int):
+def extract_frame(buf: bytes, addr: int, fc: int, explen=None):
     """Busca dentro de buf un frame Modbus válido [addr][fc]...[crc16] y lo
     devuelve, ignorando bytes ajenos antes o después (algunos dispositivos
-    — EPEVER — responden excepciones a broadcasts y ensucian el bus)."""
+    — EPEVER — responden excepciones a broadcasts y ensucian el bus).
+
+    explen: longitud esperada del frame completo (int) o función que la
+    calcula a partir de la cabecera (buf[start:start+3]). Si se conoce, se
+    verifica PRIMERO esa longitud exacta: un prefijo más corto puede dar
+    CRC 0 por casualidad (1 de 65536 por byte) y, como el contenido no
+    cambia entre reintentos, el fallo sería permanente (visto 2026-09-24 en
+    el datalog de dos tarjetas, FC 0x43 con 6 registros)."""
     if len(buf) < 5:
         return None
+    if explen is not None:
+        for start in range(0, len(buf) - 4):
+            if buf[start] != addr or buf[start + 1] != fc:
+                continue
+            n = explen(buf[start:start + 3]) if callable(explen) else explen
+            if n >= 5 and start + n <= len(buf) and \
+                    crc16(buf[start:start + n]) == 0:
+                return buf[start:start + n]
     for start in range(0, len(buf) - 4):
         if buf[start] != addr or buf[start + 1] != fc:
             continue
@@ -134,7 +149,7 @@ def disc_query(bus, nbits: int, prefix: bytes):
     raw = bus.xfer_raw(bytes([0, 0x41, 0x01, nbits]) + prefix, timeout=0.15)
     if not raw:
         return "silence", None
-    f = extract_frame(raw, 247, 0x41)
+    f = extract_frame(raw, 247, 0x41, explen=19)
     if f is not None and len(f) == 19 and f[2] == 0x01:
         return "clean", f[3:15]
     return "collision", None
@@ -143,7 +158,7 @@ def disc_query(bus, nbits: int, prefix: bytes):
 def disc_assign(bus, uid12: bytes, new_addr: int) -> bool:
     req = bytes([0, 0x41, 0x02]) + uid12 + bytes([new_addr])
     raw = bus.xfer_raw(req, timeout=0.4)      # el guardado borra flash
-    f = extract_frame(raw, new_addr, 0x41)
+    f = extract_frame(raw, new_addr, 0x41, explen=17)
     return f is not None and len(f) == 17 and f[2] == 0x02
 
 

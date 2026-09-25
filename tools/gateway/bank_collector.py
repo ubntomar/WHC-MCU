@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS live (
 def rd(bus, addr, start, count, fc=4):
     for _ in range(6):
         raw = bus.xfer_raw(struct.pack(">BBHH", addr, fc, start, count), 0.5)
-        f = extract_frame(raw, addr, fc)
+        f = extract_frame(raw, addr, fc, explen=5 + 2 * count)
         if f and len(f) == 5 + 2 * count:
             return [(f[3 + 2 * i] << 8) | f[4 + 2 * i] for i in range(count)]
     return None
@@ -95,17 +95,25 @@ def rd(bus, addr, start, count, fc=4):
 
 def get_log(bus, addr, desde, hasta, tope=400):
     """Registros [desde..hasta] del datalog, en orden de secuencia."""
-    recs, cursor, intentos = [], desde, 0
-    while cursor <= hasta and len(recs) < tope and intentos < 3 * tope:
-        intentos += 1
+    recs, cursor, fallos = [], desde, 0
+    while cursor <= hasta and len(recs) < tope:
         raw = bus.xfer_raw(struct.pack(">BBIB", addr, 0x43, cursor, 6), 0.6)
-        f = extract_frame(raw, addr, 0x43)
+        f = extract_frame(raw, addr, 0x43, explen=lambda h: 5 + h[2] * 16)
         if f and len(f) >= 5 and len(f) == 5 + f[2] * 16:
             if f[2] == 0:
                 break
             for i in range(f[2]):
                 recs.append(LOG_REC.unpack(f[3 + i * 16:3 + (i + 1) * 16]))
             cursor = recs[-1][0] + 1
+            fallos = 0
+        else:
+            # mismo cursor sin frame válido: no insistir 1200 veces (eso
+            # dejaba la recolección atascada ~12 min por tarjeta)
+            fallos += 1
+            if fallos >= 8:
+                print("  addr %d: datalog ilegible desde seq %d (%d fallos)"
+                      % (addr, cursor, fallos))
+                break
     return recs
 
 
@@ -141,9 +149,9 @@ def collect_card(bus, con, addr, now):
         return 0, None
 
     row = con.execute(
-        "SELECT seq, ts FROM samples WHERE addr=? ORDER BY seq DESC LIMIT 1",
-        (addr,)).fetchone()
-    prev_seq, prev_ts = row if row else (None, None)
+        "SELECT seq, ts, uptime FROM samples WHERE addr=? "
+        "ORDER BY seq DESC LIMIT 1", (addr,)).fetchone()
+    prev_seq, prev_ts, prev_up = row if row else (None, None, None)
 
     desde = prev_seq + 1 if prev_seq is not None else max(1, newest - 300)
     if desde > newest:
@@ -156,14 +164,38 @@ def collect_card(bus, con, addr, now):
     # hora real por interpolación entre la recolección previa y ahora
     span_seq = newest - prev_seq if prev_seq is not None else None
     span_t = now - prev_ts if prev_ts is not None else None
+
+    # Sin recolección reciente (bus desconectado días, recolector atascado)
+    # la referencia es el uptime de la tarjeta (minutos desde su arranque):
+    # exacto dentro de cada época entre resets. Épocas = tramos donde el
+    # uptime crece; un reset (POR, apagón) lo reinicia.
+    up = rd(bus, addr, 18, 2)
+    cur_up = ((up[0] << 16) | up[1]) if up else None
+    primer_corte, ultimo_corte = None, None
+    for i in range(1, len(recs)):
+        if recs[i][1] < recs[i - 1][1]:
+            if primer_corte is None:
+                primer_corte = i
+            ultimo_corte = i
+    ult_epoca_actual = cur_up is not None and recs[-1][1] <= cur_up
     filas = []
-    for seq, uptime, vmin, vmax, vavg, flags, temp in recs:
+    for i, (seq, uptime, vmin, vmax, vavg, flags, temp) in enumerate(recs):
         if span_seq and span_seq > 0 and span_t and span_t < 6 * 3600:
             ts = prev_ts + span_t * (seq - prev_seq) / span_seq
+        elif (ult_epoca_actual and
+              (ultimo_corte is None or i >= ultimo_corte) and
+              uptime <= cur_up):
+            # misma época que ahora: hora = ahora − (uptime_ahora − uptime)
+            ts = now - (cur_up - uptime) * 60
+        elif (prev_up is not None and uptime >= prev_up and
+              (primer_corte is None or i < primer_corte)):
+            # misma época que la última recolección: contar desde ella
+            ts = prev_ts + (uptime - prev_up) * 60
         else:
             # sin referencia fiable: estimar hacia atrás a 10 min por registro
             ts = now - (newest - seq) * 600
-        filas.append((addr, seq, ts, vmin, vmax, vavg, flags, temp, uptime))
+        filas.append((addr, seq, min(ts, now), vmin, vmax, vavg, flags,
+                      temp, uptime))
 
     revisar(con, addr, filas)
     con.executemany(
