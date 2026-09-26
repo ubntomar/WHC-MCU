@@ -141,11 +141,18 @@ class UdpBus(BusBase):
         up, boots, xfers, tmo = struct.unpack(">IIII", b[:16])
         flags = b[16]
         overrun, rx_bytes, tx_frames = struct.unpack(">III", b[17:29])
-        return {"uptime_s": up, "boot_count": boots, "xfers": xfers,
-                "timeouts": tmo, "wg_up": bool(flags & 1),
-                "bus_ready": bool(flags & 2), "bus_echo": bool(flags & 4),
-                "rx_overrun": overrun,
-                "rx_bytes": rx_bytes, "tx_frames": tx_frames}
+        d = {"uptime_s": up, "boot_count": boots, "xfers": xfers,
+             "timeouts": tmo, "wg_up": bool(flags & 1),
+             "bus_ready": bool(flags & 2), "bus_echo": bool(flags & 4),
+             "rx_overrun": overrun,
+             "rx_bytes": rx_bytes, "tx_frames": tx_frames}
+        if len(b) >= 34:                          # firmware con OTA (v0.1.0+)
+            v = struct.unpack(">I", b[29:33])[0]
+            bs = b[33]
+            d["fw_version"] = "%d.%d.%d" % (v >> 16, (v >> 8) & 0xFF, v & 0xFF)
+            d["fw_state"] = ("confirmado" if bs & 1 else "EN PRUEBA (trial %d)" % ((bs >> 1) & 7)) + \
+                            (" + pendiente" if bs & 16 else "")
+        return d
 
 
 def open_bus(port: str):
