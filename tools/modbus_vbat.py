@@ -91,6 +91,7 @@ class UdpBus(BusBase):
         self.sock.connect((host, port))
         self.seq = 0
         self.host, self.port = host, port
+        self.warned_noport = False
 
     def _exchange(self, pkt: bytes, wait: float):
         self.sock.settimeout(wait)
@@ -123,7 +124,11 @@ class UdpBus(BusBase):
             if r[2] == 1:                         # BUSY
                 time.sleep(0.05)
                 continue
-            return b""                            # BAD: petición inválida
+            if r[2] == 3 and not self.warned_noport:   # NOPORT: sin adaptador RS-485
+                print("nodo: SIN PUERTO RS-485 (¿adaptador USB desconectado?)",
+                      file=sys.stderr)
+                self.warned_noport = True
+            return b""                            # BAD / NOPORT
         return b""
 
     def status(self):
@@ -134,10 +139,12 @@ class UdpBus(BusBase):
             return None
         b = r[3:]
         up, boots, xfers, tmo = struct.unpack(">IIII", b[:16])
-        wg = b[16]
+        flags = b[16]
         overrun, rx_bytes, tx_frames = struct.unpack(">III", b[17:29])
         return {"uptime_s": up, "boot_count": boots, "xfers": xfers,
-                "timeouts": tmo, "wg_up": bool(wg), "rx_overrun": overrun,
+                "timeouts": tmo, "wg_up": bool(flags & 1),
+                "bus_ready": bool(flags & 2), "bus_echo": bool(flags & 4),
+                "rx_overrun": overrun,
                 "rx_bytes": rx_bytes, "tx_frames": tx_frames}
 
 

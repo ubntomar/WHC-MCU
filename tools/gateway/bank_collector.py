@@ -23,7 +23,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/home/orangepi")
-from modbus_vbat import Bus, extract_frame, LOG_REC, default_port
+from modbus_vbat import Bus, extract_frame, LOG_REC, default_port, open_bus  # noqa: F401
 
 DB = os.environ.get("BANK_DB", "/home/orangepi/bank.db")
 LOCK = "/tmp/bank_collector.lock"
@@ -287,15 +287,16 @@ def main():
     except OSError:
         return 0                      # ya hay una recolección en curso
 
-    port = default_port()
-    if not os.path.exists(port):
+    # BANK_PORT=udp://IP[:5485] → bus remoto a través de un nodo rs485_gw
+    port = os.environ.get("BANK_PORT") or default_port()
+    if not port.startswith("udp://") and not os.path.exists(port):
         print("%s  sin puerto serie (%s)" % (time.strftime("%F %T"), port))
         return 1
 
     con = sqlite3.connect(DB)
     con.executescript(SCHEMA)
     now = time.time()
-    bus = Bus(port)
+    bus = open_bus(port)
 
     resumen = []
     for addr, (nombre, _cap) in sorted(CARDS.items()):
