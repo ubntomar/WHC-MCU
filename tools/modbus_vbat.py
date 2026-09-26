@@ -16,6 +16,7 @@ Registros: ver cabecera de modbus_vbat/main.c.
 
 import argparse
 import os
+import socket
 import struct
 import sys
 import termios
@@ -47,7 +48,109 @@ def crc16(data: bytes) -> int:
     return crc
 
 
-class Bus:
+class BusBase:
+    """Operaciones Modbus comunes; cada transporte implementa xfer_raw()."""
+
+    def xfer_raw(self, req: bytes, timeout: float = 0.25) -> bytes:
+        raise NotImplementedError
+
+    def xfer(self, req: bytes, timeout: float = 0.25) -> bytes:
+        buf = self.xfer_raw(req, timeout)
+        if len(buf) < 5 or crc16(buf) != 0:
+            return b""
+        return buf[:-2]
+
+    def read_regs(self, addr: int, fc: int, start: int, count: int):
+        r = self.xfer(struct.pack(">BBHH", addr, fc, start, count))
+        if len(r) < 3 or r[0] != addr or r[1] != fc or r[2] != count * 2:
+            return None
+        return list(struct.unpack(f">{count}H", r[3:3 + count * 2]))
+
+    def write_reg(self, addr: int, reg: int, val: int,
+                  timeout: float = 0.25) -> bool:
+        req = struct.pack(">BBHH", addr, 0x06, reg, val)
+        r = self.xfer(req, timeout)
+        return r == req
+
+    def save_cfg(self, addr: int) -> bool:
+        """Persistir en flash: el borrado de página puede tardar >250 ms."""
+        return self.write_reg(addr, 2, 0xA55A, timeout=1.5)
+
+
+class UdpBus(BusBase):
+    """Bus remoto a través de un nodo rs485_gw (CH32V307): una trama RTU por
+    datagrama UDP, protocolo en rs485-gateway/docs/PROTOCOLO_UDP.md.
+    El timeout de cada xfer_raw viaja al nodo (es él quien espera al bus); al
+    socket se le suma margen para el RTT del túnel. Un datagrama perdido se
+    reintenta una vez; BUSY (otra transacción en curso) espera y reintenta."""
+
+    RTT_MARGIN = 1.0
+
+    def __init__(self, host: str, port: int = 5485):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.connect((host, port))
+        self.seq = 0
+        self.host, self.port = host, port
+
+    def _exchange(self, pkt: bytes, wait: float):
+        self.sock.settimeout(wait)
+        try:
+            self.sock.send(pkt)
+        except OSError:
+            return None
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            try:
+                r = self.sock.recv(2048)
+            except (socket.timeout, OSError):
+                return None
+            if len(r) >= 3 and r[0] == pkt[0] and r[1] == pkt[1]:
+                return r                          # respuesta a ESTE seq
+            # respuesta tardía de un seq anterior: ignorar y seguir esperando
+        return None
+
+    def xfer_raw(self, req: bytes, timeout: float = 0.25) -> bytes:
+        frame = req + struct.pack("<H", crc16(req))
+        ms = max(1, min(5000, int(timeout * 1000)))
+        for _ in range(3):
+            self.seq = (self.seq + 1) & 0xFF
+            r = self._exchange(bytes([0x01, self.seq]) + struct.pack(">H", ms) + frame,
+                               timeout + self.RTT_MARGIN)
+            if r is None:
+                continue                          # datagrama perdido: reintentar
+            if r[2] == 0:
+                return r[3:]
+            if r[2] == 1:                         # BUSY
+                time.sleep(0.05)
+                continue
+            return b""                            # BAD: petición inválida
+        return b""
+
+    def status(self):
+        """Salud del nodo: dict o None si no responde."""
+        self.seq = (self.seq + 1) & 0xFF
+        r = self._exchange(bytes([0x02, self.seq]), 2.0)
+        if r is None or r[2] != 0 or len(r) < 3 + 29:
+            return None
+        b = r[3:]
+        up, boots, xfers, tmo = struct.unpack(">IIII", b[:16])
+        wg = b[16]
+        overrun, rx_bytes, tx_frames = struct.unpack(">III", b[17:29])
+        return {"uptime_s": up, "boot_count": boots, "xfers": xfers,
+                "timeouts": tmo, "wg_up": bool(wg), "rx_overrun": overrun,
+                "rx_bytes": rx_bytes, "tx_frames": tx_frames}
+
+
+def open_bus(port: str):
+    """'udp://host[:puerto]' → UdpBus (nodo rs485_gw); si no, puerto serie local."""
+    if port.startswith("udp://"):
+        hp = port[6:]
+        host, _, p = hp.partition(":")
+        return UdpBus(host, int(p) if p else 5485)
+    return Bus(port)
+
+
+class Bus(BusBase):
     def __init__(self, port: str):
         self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
         t = termios.tcgetattr(self.fd)
@@ -79,28 +182,6 @@ class Bus:
             else:
                 time.sleep(0.002)
         return buf
-
-    def xfer(self, req: bytes, timeout: float = 0.25) -> bytes:
-        buf = self.xfer_raw(req, timeout)
-        if len(buf) < 5 or crc16(buf) != 0:
-            return b""
-        return buf[:-2]
-
-    def read_regs(self, addr: int, fc: int, start: int, count: int):
-        r = self.xfer(struct.pack(">BBHH", addr, fc, start, count))
-        if len(r) < 3 or r[0] != addr or r[1] != fc or r[2] != count * 2:
-            return None
-        return list(struct.unpack(f">{count}H", r[3:3 + count * 2]))
-
-    def write_reg(self, addr: int, reg: int, val: int,
-                  timeout: float = 0.25) -> bool:
-        req = struct.pack(">BBHH", addr, 0x06, reg, val)
-        r = self.xfer(req, timeout)
-        return r == req
-
-    def save_cfg(self, addr: int) -> bool:
-        """Persistir en flash: el borrado de página puede tardar >250 ms."""
-        return self.write_reg(addr, 2, 0xA55A, timeout=1.5)
 
 
 def fmt_uid(regs):
@@ -562,7 +643,8 @@ def cmd_set_cal_raw(bus, addr, factor):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("-p", "--port", default=DEF_PORT)
+    ap.add_argument("-p", "--port", default=DEF_PORT,
+                    help="puerto serie o udp://host[:5485] (nodo rs485_gw)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("scan")
@@ -596,6 +678,9 @@ def main():
                    help="primera dirección candidata (def. 1)")
     s.add_argument("--one", action="store_true",
                    help="asignar UNA sola tarjeta y parar (marcarla por LED)")
+
+    s = sub.add_parser("gw-status",
+                       help="salud del nodo rs485_gw (solo -p udp://...)")
 
     s = sub.add_parser("factory-reset",
                        help="devuelve una tarjeta al estado sin configurar")
@@ -636,7 +721,7 @@ def main():
     s.add_argument("minutes", type=int)
 
     a = ap.parse_args()
-    bus = Bus(a.port)
+    bus = open_bus(a.port)
 
     if a.cmd == "scan":
         cmd_scan(bus, a.lo, a.hi)
@@ -652,6 +737,14 @@ def main():
         cmd_set_cal_raw(bus, a.addr, a.factor)
     elif a.cmd == "discover":
         cmd_discover(bus, a.assign, a.start, 1 if a.one else 0)
+    elif a.cmd == "gw-status":
+        if not isinstance(bus, UdpBus):
+            sys.exit("gw-status requiere -p udp://host[:puerto]")
+        info = bus.status()
+        if info is None:
+            sys.exit(f"nodo {bus.host}:{bus.port}: sin respuesta")
+        for k, v in info.items():
+            print(f"  {k:<12} = {v}")
     elif a.cmd == "factory-reset":
         cmd_factory_reset(bus, a.addr)
     elif a.cmd == "hang-test":
